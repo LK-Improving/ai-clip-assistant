@@ -1,0 +1,14 @@
+node_modules/
+dist/
+out/
+.vite/
+# 完整版 ffmpeg 二进制随包分发，体积大，不入库（构建时由 extraResource 拷贝）
+**/extraResources/ffmpeg/
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.local
+coverage/
+.eslintcache
+*.tsbuildinfo

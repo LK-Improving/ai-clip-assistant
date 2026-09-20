@@ -1,0 +1,25 @@
+---
+description: "KK剪映 React 渲染进程页面、组件、Hooks、状态与样式规则"
+globs: "apps/desktop/src/**/*.tsx,apps/desktop/src/**/*.ts,apps/desktop/src/styles/**,apps/desktop/src/components/**,apps/desktop/src/pages/**"
+alwaysApply: false
+---
+
+# React 前端规则
+
+在修改渲染进程 `.tsx`、页面、组件、Hooks、状态、样式或客户端 IPC 调用时读取。
+
+## 项目约定
+
+- React 19 + Vite 7 + TypeScript；样式使用 TailwindCSS 4 和现有 shadcn/ui 风格。
+- 页面在 `apps/desktop/src/pages/`，共享 UI 在 `src/components/`，工程/Agent 桥接在 `src/lib/` 和 `src/hooks/`。
+- 系统能力只通过 `window.electronAPI`；不得在渲染进程引入 Node、fs、child_process 或直接调用外部 Provider。
+
+## 分层
+
+- 页面负责组合、交互和页面状态；可复用组件不得藏入页面专属流程。
+- Hooks/lib 负责可复用状态、副作用和 IPC payload 转换；沿用现有类型，不复制协议解析。
+- Agent 进度、导出和预览必须覆盖加载、空态、失败、取消和成功状态。
+
+## 交付
+
+- 修改页面或组件后运行 `pnpm typecheck`；涉及 Agent/桌面流程时补跑对应 smoke 命令。

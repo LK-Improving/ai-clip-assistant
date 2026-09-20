@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Allow JIT compilation (V8/Electron renderer) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- Allow unsigned executable memory (required by bundled ffmpeg binary) -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <!-- Disable library validation so ffmpeg can load its dynamic libraries -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <!-- Allow DYLD environment variables in development -->
+  <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+  <true/>
+  <!-- Network access for telemetry/updates/AI services -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <!-- Read/write user-selected files (videos, projects, exports) -->
+  <key>com.apple.security.files.user-selected.read-write</key>
+  <true/>
+  <!-- Debugging entitlement, remove for App Store / release signing -->
+  <key>com.apple.security.get-task-allow</key>
+  <true/>
+</dict>
+</plist>

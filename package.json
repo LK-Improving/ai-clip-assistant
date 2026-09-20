@@ -1,0 +1,36 @@
+{
+  "name": "kk-jianying",
+  "version": "0.1.0",
+  "private": true,
+  "description": "企业级类剪映视频智能剪辑工具 Monorepo · KK剪映（Electron + Vite + React 19 + LangGraph + FFmpeg）",
+  "author": "KK剪映",
+  "authors": "KK剪映",
+  "license": "MIT",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20.19.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build:core": "pnpm --filter @miaoma/video-project build",
+    "build:agent": "pnpm --filter @miaoma/agent build",
+    "build:libs": "pnpm run build:core && pnpm run build:agent",
+    "dev:core": "pnpm --filter @miaoma/video-project dev",
+    "dev": "pnpm run build:libs && pnpm --filter @miaoma/desktop start",
+    "start": "pnpm run dev",
+    "build": "pnpm run build:libs && pnpm --filter @miaoma/desktop build",
+    "package": "pnpm run build:libs && pnpm --filter @miaoma/desktop package",
+    "make": "pnpm run build:libs && pnpm --filter @miaoma/desktop make",
+    "bench:dist": "node scripts/bench/startup.mjs",
+    "bench:metrics": "node scripts/bench/metrics.mjs",
+    "vision:warmup": "node scripts/vision/warmup.mjs",
+    "typecheck": "pnpm -r typecheck",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
+    "husky": "^9.1.7",
+    "typescript": "~5.9.3"
+  }
+}

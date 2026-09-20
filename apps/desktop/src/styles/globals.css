@@ -1,0 +1,121 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+}
+
+/* 剪辑工具默认深色 + KK剪映品牌紫（对照设计稿 12 屏） */
+.dark {
+  --background: oklch(0.165 0.018 290);
+  --foreground: oklch(0.96 0.005 290);
+  --card: oklch(0.215 0.022 290);
+  --card-foreground: oklch(0.96 0.005 290);
+  --popover: oklch(0.22 0.024 290);
+  --popover-foreground: oklch(0.96 0.005 290);
+  --primary: oklch(0.62 0.202 288);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.27 0.026 290);
+  --secondary-foreground: oklch(0.96 0.005 290);
+  --muted: oklch(0.265 0.024 290);
+  --muted-foreground: oklch(0.68 0.02 290);
+  --accent: oklch(0.28 0.04 288);
+  --accent-foreground: oklch(0.96 0.005 290);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 14%);
+  --ring: oklch(0.62 0.202 288);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family:
+      'Inter', 'Microsoft YaHei', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer utilities {
+  /* 品牌渐变（按钮 / logo / 高亮块） */
+  .bg-brand {
+    background-image: linear-gradient(120deg, #7c3aed 0%, #8b5cf6 45%, #c084fc 100%);
+  }
+
+  .text-brand-gradient {
+    background-image: linear-gradient(120deg, #a78bfa 0%, #c084fc 50%, #7dd3fc 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* 启动页极光背景 */
+  .bg-aurora {
+    background:
+      radial-gradient(52rem 30rem at 12% -8%, rgb(124 58 237 / 0.4), transparent 60%),
+      radial-gradient(44rem 26rem at 88% 12%, rgb(56 189 248 / 0.16), transparent 60%),
+      radial-gradient(50rem 34rem at 55% 110%, rgb(192 132 252 / 0.22), transparent 62%),
+      oklch(0.14 0.02 290);
+  }
+
+  /* 时间线波形纹理 */
+  .bg-wave {
+    background-image: repeating-linear-gradient(
+      90deg,
+      rgb(255 255 255 / 0.35) 0 2px,
+      transparent 2px 5px
+    );
+  }
+}

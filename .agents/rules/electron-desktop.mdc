@@ -1,0 +1,16 @@
+---
+description: "KK剪映 Electron 主进程、预加载、IPC、媒体与外部 Provider 边界规则"
+globs: "apps/desktop/src/main/**,apps/desktop/src/preload.ts,apps/desktop/src/types/electron-api.d.ts,apps/desktop/forge.config.ts,packages/agent/src/**,packages/core/src/**"
+alwaysApply: false
+---
+
+# Electron 桌面分层规则
+
+在修改主进程、预加载、IPC、工程落盘、FFmpeg、Agent、TTS/LLM/视频生成 Provider 或核心 DSL 时读取。
+
+- 主进程负责 Node 系统能力、文件路径校验、子进程和外部服务；预加载只暴露最小、可类型化的 API；渲染进程不越过桥接层。
+- `packages/core` 保持纯数据模型和迁移校验；`packages/agent` 通过 Provider 接口编排，不直接耦合 Electron UI。
+- IPC 命令与事件必须有输入/输出类型、错误语义、取消策略和调用方；不要把密钥写入日志或文档。
+- `miaoma://` 继续执行路径白名单和 Range 语义；FFmpeg 失败、导出目标不可写和外部服务不可达必须给出可诊断错误。
+
+验证：`pnpm typecheck`；Agent 改动运行 `pnpm smoke:agent`；媒体/IPC 改动运行 `pnpm smoke`。

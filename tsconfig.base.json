@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Miaoma Studio Base",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+
+    /* 严格性：工程化项目一律拉满 */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    /* 互操作 */
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmit": true,
+
+    "baseUrl": ".",
+    "paths": {
+      "@miaoma/video-project": ["packages/core/src/index.ts"],
+      "@miaoma/video-project/*": ["packages/core/src/*"],
+      "@miaoma/agent": ["packages/agent/src/index.ts"],
+      "@miaoma/agent/*": ["packages/agent/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist", "out", ".vite"]
+}

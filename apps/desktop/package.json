@@ -1,0 +1,52 @@
+{
+  "name": "@miaoma/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KK剪映 桌面端：Electron + Vite + React 19",
+  "author": "KK剪映",
+  "authors": "KK剪映",
+  "main": ".vite/build/main.js",
+  "scripts": {
+    "start": "node scripts/forge.cjs start",
+    "package": "node scripts/forge.cjs package",
+    "make": "node scripts/forge.cjs make",
+    "publish": "node scripts/forge.cjs publish",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke/run.mjs",
+    "smoke:agent": "node scripts/smoke/agent-run.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.0",
+    "@miaoma/agent": "workspace:*",
+    "@miaoma/video-project": "workspace:*",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "isomorphic-git": "^1.42.2",
+    "lucide-react": "^1.45.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwind-merge": "^3.6.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-deb": "^7.11.2",
+    "@electron-forge/maker-dmg": "^7.11.2",
+    "@electron-forge/maker-rpm": "^7.11.2",
+    "@electron-forge/maker-zip": "^7.11.2",
+    "@electron-forge/plugin-vite": "^7.11.2",
+    "@electron-forge/shared-types": "^7.11.2",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "app-builder-lib": "^26.15.3",
+    "electron": "^44.3.0",
+    "electron-forge-maker-nsis": "^26.0.0",
+    "tailwindcss": "^4.3.3",
+    "ts-node": "^10.9.2",
+    "tw-animate-css": "^1.4.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6"
+  }
+}

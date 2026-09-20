@@ -1,0 +1,16 @@
+---
+description: "KK剪映 IPC、Agent 事件、工程 DSL 与外部 Provider 契约规则"
+globs: "apps/desktop/src/main/ipc.ts,apps/desktop/src/preload.ts,apps/desktop/src/types/**,apps/desktop/src/main/services/**,packages/agent/src/**,packages/core/src/**,.agents/Documents/接口设计/**"
+alwaysApply: false
+---
+
+# IPC 与接口契约规则
+
+适用于 IPC invoke/handle、send/on、Agent 事件、工程 JSON、TTS WebSocket 及外部 HTTP Provider。
+
+- 先引用 `.agents/Documents/接口设计/` 中已确认的契约；没有契约时先记录来源、payload、错误、取消、重试和降级策略。
+- 变更事件名、字段、工程 schemaVersion、Provider 配置或 Range 响应时，同时更新主进程、预加载、类型声明、渲染调用方和测试/冒烟脚本。
+- Agent 进度必须明确节点、状态、百分比、错误、暂停/恢复和完成；外部流式连接必须定义断连与超时。
+- 不在契约文件中写 API Key、token、真实用户路径或生产连接串。
+
+验证：`pnpm typecheck`，并按边界运行 `pnpm smoke` 或 `pnpm smoke:agent`。

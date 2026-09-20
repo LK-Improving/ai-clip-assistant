@@ -1,0 +1,12 @@
+---
+description: "KK剪映需求、契约、UI、桌面实现与验收产物交接规则"
+globs: ".agents/Documents/需求分析/**,.agents/Documents/接口设计/**,.agents/Documents/UI设计/**,.agents/Documents/联调验收/**,docs/**,apps/desktop/src/**,packages/**"
+alwaysApply: false
+---
+
+# 产物交接规则
+
+- 需求产物放 `.agents/Documents/需求分析/`，接口/IPC/Provider 契约放 `.agents/Documents/接口设计/`，UI 规格放 `.agents/Documents/UI设计/`，验收放 `.agents/Documents/联调验收/`。
+- 下游实现必须引用上游文件路径、版本或生成时间；契约未确认时不得自行猜测字段或事件语义。
+- UI、渲染进程、主进程和 Agent 的交接至少记录输入、输出、错误、取消、降级与验证命令。
+- 验收报告只写实际运行结果；未运行的 smoke、构建或外部服务验证必须标为未验证。
