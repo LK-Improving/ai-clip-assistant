@@ -66,6 +66,8 @@ export function loadTimelineFromProject(): void {
   tracks = restored.length > 0 ? restored : defaultTracks();
   selection = null;
   loaded = true;
+  // 切工程后旧快照已不属于当前时间线，继续保留会「撤销」到另一个工程的状态
+  undoStack.length = 0;
   emit();
 }
 
@@ -188,12 +190,42 @@ function reduce(current: TimelineTrack[], action: TimelineAction): { next: Timel
 export interface ApplyResult {
   applied: number;
   skipped: string[];
+  /** 本批改动已压入撤销栈，可回退（对话式批量改动的安全网） */
+  undoable: boolean;
 }
 
 /**
- * 应用一批动作：整批只通知一次订阅者、只排一次落盘。
- * 目标不存在的动作被逐条跳过并回报原因（R2 的确认卡片与失败回执依赖这个信息）。
+ * 撤销栈：每批成功改动前压入上一份 tracks。
+ *
+ * 用内存快照而不是走 M5 的 git 版本仓：对话式剪辑的「撤销刚才那步」要的是
+ * 毫秒级回退到上一个编辑态，跟「回到昨天那个版本」是两个不同的需求；
+ * 跨会话的版本回滚仍由 services/versioning 负责。
  */
+const undoStack: TimelineTrack[][] = [];
+const UNDO_LIMIT = 50;
+
+function pushUndo(previous: TimelineTrack[]): void {
+  undoStack.push(previous.map((track) => ({ ...track, clips: track.clips.map((clip) => ({ ...clip })) })));
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+}
+
+export function canUndo(): boolean {
+  return undoStack.length > 0;
+}
+
+/** 回退一步；返回回退后的片段数供调用方提示，栈空时返回 null */
+export function undoTimeline(): { clips: number; remaining: number } | null {
+  const previous = undoStack.pop();
+  if (!previous) return null;
+  tracks = previous;
+  selection = null;
+  emit();
+  persistSoon();
+  return { clips: tracks.reduce((n, track) => n + track.clips.length, 0), remaining: undoStack.length };
+}
+
+/** 应用一批动作：整批只通知一次订阅者、只排一次落盘。
+ * 目标不存在的动作被逐条跳过并回报原因（R2 的确认卡片与失败回执依赖这个信息）。 */
 export function applyTimelineActions(actions: TimelineAction[]): ApplyResult {
   ensureTimelineLoaded();
   const skipped: string[] = [];
@@ -208,6 +240,7 @@ export function applyTimelineActions(actions: TimelineAction[]): ApplyResult {
   }
   const applied = actions.length - skipped.length;
   if (applied > 0) {
+    pushUndo(tracks);
     tracks = next;
     if (selection && !tracks.some((track) => track.id === selection?.trackId && track.clips.some((c) => c.id === selection?.clipId))) {
       selection = null;
@@ -215,7 +248,7 @@ export function applyTimelineActions(actions: TimelineAction[]): ApplyResult {
     emit();
     persistSoon();
   }
-  return { applied, skipped };
+  return { applied, skipped, undoable: applied > 0 };
 }
 
 /** 立即落盘（导出前、页面卸载前调用），防抖窗口内的改动不会丢 */

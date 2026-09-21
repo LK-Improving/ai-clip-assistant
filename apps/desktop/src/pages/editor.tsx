@@ -12,7 +12,7 @@ import {
   useTimelineSelection,
   useTimelineTracks,
 } from '@/hooks/use-timeline';
-import { nextFreeStart, onSeekRequest } from '@/lib/timeline-store';
+import { nextFreeStart, onSeekRequest, undoTimeline } from '@/lib/timeline-store';
 import {
   formatTimecode,
   timelineTotalMs,
@@ -213,12 +213,18 @@ export default function EditorPage() {
     [applyActions],
   );
 
-  // Delete 键删除选中片段
+  // Delete 键删除选中片段；Ctrl/Cmd+Z 撤销上一次时间线改动（含 AI 助手批量改）
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Delete' && event.key !== 'Backspace') return;
       const target = event.target as HTMLElement | null;
+      // 正在输入文本时不抢快捷键：Ctrl+Z 应该是输入框自己的撤销
       if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z') {
+        if (undoTimeline()) event.preventDefault();
+        return;
+      }
+      if (event.key !== 'Delete' && event.key !== 'Backspace') return;
       if (!selected) return;
       event.preventDefault();
       handleDeleteClip(selected.trackId, selected.clipId);

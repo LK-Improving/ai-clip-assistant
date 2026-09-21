@@ -1,11 +1,11 @@
-import { ArrowUp, Eraser, PanelRightClose, PanelRightOpen, Plus, Sparkles } from 'lucide-react';
+import { ArrowUp, Eraser, PanelRightClose, PanelRightOpen, Plus, Sparkles, Undo2 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { ThumbPlaceholder } from '@/components/ui/misc';
-import { useApplyTimeline, useTimelineSelection, useTimelineTracks } from '@/hooks/use-timeline';
+import { useApplyTimeline, useCanUndo, useTimelineSelection, useTimelineTracks, undoTimeline } from '@/hooks/use-timeline';
 import { getAgentSession, subscribeAgentSession } from '@/lib/agent-session';
 import type { AgentSessionState } from '@/lib/agent-session';
-import { buildTimelineSnapshot, translatePlan } from '@/lib/assistant-apply';
+import { buildTimelineSnapshot, translatePlan, type PendingInsert } from '@/lib/assistant-apply';
 import { nextFreeStart, requestSeek, trackForKind, type TimelineAction } from '@/lib/timeline-store';
 import { formatTimecode, timelineTotalMs, type TimelineClip, type TimelineTrack } from '@/lib/timeline-utils';
 import type { LibraryEntry } from '@/preload';
@@ -34,6 +34,9 @@ interface PendingPlan {
   notes: string[];
   actions: TimelineAction[];
   seekMs: number | null;
+  /** 确认时才去素材库检索的插件（translatePlan 是同步的，检索异步） */
+  inserts: PendingInsert[];
+  undo: boolean;
 }
 
 /**
@@ -78,6 +81,15 @@ function clipFromEntry(entry: LibraryEntry): Omit<TimelineClip, 'id'> {
   };
 }
 
+/** 按描述从素材库选一条最合适的素材（语义检索 topK 后按类型过滤取首位） */
+async function pickAsset(query: string, kind: string): Promise<LibraryEntry | null> {
+  const api = window.electronAPI;
+  if (!api?.library?.search) return null;
+  const hits = await api.library.search(query, 12);
+  const hit = hits.find((item) => item.entry.kind === kind) ?? hits.find((item) => !item.entry.error);
+  return hit?.entry ?? null;
+}
+
 export function AssistantDock({ route }: { route: string }) {
   const [open, setOpen] = useState(() => AUTO_OPEN_ROUTES.has(route));
   const [input, setInput] = useState('');
@@ -88,6 +100,8 @@ export function AssistantDock({ route }: { route: string }) {
   const applyActions = useApplyTimeline();
   const [messages, setMessages] = useState<DockMessage[]>([]);
   const [pending, setPending] = useState<PendingPlan | null>(null);
+  const [applying, setApplying] = useState(false);
+  const undoable = useCanUndo();
   const listRef = useRef<HTMLDivElement | null>(null);
   const greeted = useRef(false);
 
@@ -175,13 +189,15 @@ export function AssistantDock({ route }: { route: string }) {
             const translated = translatePlan(plan, tracks, selection);
             push({ role: 'assistant', text: plan.reply });
             for (const note of translated.notes) push({ role: 'system', text: note });
-            if (translated.actions.length > 0 || translated.seekMs !== null) {
+            if (translated.actions.length > 0 || translated.seekMs !== null || translated.inserts.length > 0 || translated.undo) {
               setPending({
                 reply: plan.reply,
                 lines: translated.lines,
                 notes: translated.notes,
                 actions: translated.actions,
                 seekMs: translated.seekMs,
+                inserts: translated.inserts,
+                undo: translated.undo,
               });
             } else if (!translated.lines.length) {
               push({ role: 'system', text: '本次没有可执行的改动，时间线未变。' });
@@ -197,18 +213,68 @@ export function AssistantDock({ route }: { route: string }) {
     [push, tracks, selection],
   );
 
-  /** 确认应用：走 R1 的统一 action 通道，回执直接告诉用户成没成、哪条没成 */
-  const confirmPending = useCallback(() => {
-    if (!pending) return;
-    const result = pending.actions.length ? applyActions(pending.actions) : { applied: 0, skipped: [] };
-    if (pending.seekMs !== null) requestSeek(pending.seekMs);
+  /**
+   * 确认应用：先按需回退，再把 insertAsset 异步解析成 addClip，最后走统一 action 通道。
+   *
+   * 顺序有意为之：undo 先执行，同批的后续动作才能落在回退后的真实片段上；
+   * 目标已不存在的动作会被 store 逐条跳过并回 reason，不会静默改错东西。
+   */
+  const confirmPending = useCallback(async () => {
+    if (!pending || applying) return;
+    setApplying(true);
     const parts: string[] = [];
-    if (result.applied > 0) parts.push(`已应用 ${result.applied} 项改动`);
-    if (result.skipped.length) parts.push(`跳过：${result.skipped.join('；')}`);
-    if (result.applied === 0 && !result.skipped.length && pending.seekMs !== null) parts.push('已跳转播放头');
+    try {
+      if (pending.undo) {
+        const undone = undoTimeline();
+        parts.push(undone ? `已撤销上一次改动（还剩 ${undone.remaining} 步可退）` : '没有可撤销的改动');
+      }
+
+      const actions = [...pending.actions];
+      for (const insert of pending.inserts) {
+        const entry = await pickAsset(insert.query, insert.kind);
+        if (!entry) {
+          parts.push(`素材库没找到「${insert.query}」，这条未执行`);
+          continue;
+        }
+        const track = trackForKind(insert.kind);
+        if (!track) {
+          parts.push(`目标轨道已不存在，「${entry.name}」未插入`);
+          continue;
+        }
+        const base = clipFromEntry(entry);
+        actions.push({
+          type: 'addClip',
+          trackId: track.id,
+          clip: { ...base, start: insert.startMs ?? nextFreeStart(track) },
+        });
+        parts.push(`已选用「${entry.name}」`);
+      }
+
+      if (pending.seekMs !== null) requestSeek(pending.seekMs);
+      if (actions.length) {
+        const result = applyActions(actions);
+        if (result.applied > 0) parts.push(`已应用 ${result.applied} 项改动`);
+        if (result.skipped.length) parts.push(`跳过：${result.skipped.join('；')}`);
+      } else if (pending.seekMs !== null) {
+        parts.push('已跳转播放头');
+      }
+    } catch (error) {
+      parts.push(`执行出错：${(error as Error).message}`);
+    } finally {
+      setApplying(false);
+    }
+
     push({ role: 'system', text: parts.join(' · ') || '未产生任何改动' });
     setPending(null);
-  }, [applyActions, pending, push]);
+  }, [applying, applyActions, pending, push]);
+
+  const undoLast = useCallback(() => {
+    const undone = undoTimeline();
+    push({
+      role: 'system',
+      text: undone ? `已撤销上一次改动（${undone.clips} 个片段，还剩 ${undone.remaining} 步可退）` : '没有可撤销的改动。',
+    });
+  }, [push]);
 
   const cancelPending = useCallback(() => {
     setPending(null);
@@ -269,6 +335,14 @@ export function AssistantDock({ route }: { route: string }) {
           </span>
         ) : null}
         <div className="ml-auto flex items-center gap-1">
+          <button
+            title={undoable ? '撤销上一次时间线改动' : '没有可撤销的改动'}
+            onClick={undoLast}
+            disabled={!undoable}
+            className="rounded p-1 text-muted-foreground hover:bg-secondary hover:text-foreground disabled:opacity-40"
+          >
+            <Undo2 className="size-3.5" />
+          </button>
           <button
             title="清空会话"
             onClick={() => {
@@ -343,10 +417,15 @@ export function AssistantDock({ route }: { route: string }) {
             ))}
           </ul>
           <div className="mt-2.5 flex gap-2">
-            <Button size="sm" className="h-7 flex-1 rounded-full text-xs" onClick={confirmPending}>
-              确认应用
+            <Button
+              size="sm"
+              className="h-7 flex-1 rounded-full text-xs"
+              onClick={() => void confirmPending()}
+              disabled={applying}
+            >
+              {applying ? '执行中…' : '确认应用'}
             </Button>
-            <Button size="sm" variant="ghost" className="h-7 flex-1 rounded-full text-xs" onClick={cancelPending}>
+            <Button size="sm" variant="ghost" className="h-7 flex-1 rounded-full text-xs" onClick={cancelPending} disabled={applying}>
               取消
             </Button>
           </div>

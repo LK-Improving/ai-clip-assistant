@@ -136,6 +136,17 @@ export interface PlanTranslation {
   notes: string[];
   /** 播放头跳转目标（不进 action 通道，走 seek 事件） */
   seekMs: number | null;
+  /** 需要先去素材库检索（异步）才能变成 addClip 的插件请求 */
+  inserts: PendingInsert[];
+  /** 本批是否包含「撤销上一次改动」 */
+  undo: boolean;
+}
+
+/** 待解析的插件：模型只说“找什么”，选件由本地检索完成 */
+export interface PendingInsert {
+  query: string;
+  kind: 'video' | 'audio' | 'text';
+  startMs: number | null;
 }
 
 /**
@@ -152,12 +163,37 @@ export function translatePlan(
   const actions: TimelineAction[] = [];
   const lines: string[] = [];
   const notes: string[] = [];
+  const inserts: PendingInsert[] = [];
   let seekMs: number | null = null;
+  let undo = false;
 
   for (const action of plan.actions ?? []) {
     if (action.type === 'seekTo') {
       seekMs = action.startMs;
       lines.push(`播放头跳到 ${seconds(action.startMs)}`);
+      continue;
+    }
+
+    if (action.type === 'undo') {
+      undo = true;
+      lines.push('先撤销上一次批量改动（回到改动前的时间线）');
+      continue;
+    }
+
+    if (action.type === 'insertAsset') {
+      const kind = action.kind ?? 'video';
+      const label = kind === 'video' ? '视频' : kind === 'audio' ? '音频' : '字幕';
+      const track = tracks.find((item) => item.kind === kind);
+      if (!track) {
+        notes.push(`时间线里没有${label}轨，无法插入「${action.query}」（可先点「+ ${label}轨」）。`);
+        continue;
+      }
+      inserts.push({ query: action.query, kind, startMs: action.startMs ?? null });
+      lines.push(
+        `从素材库找「${action.query}」插入到「${track.name}」${
+          action.startMs !== undefined ? ` 的 ${seconds(action.startMs)}` : ' 末尾'
+        }`,
+      );
       continue;
     }
 
@@ -197,6 +233,41 @@ export function translatePlan(
       continue;
     }
 
+    if (action.type === 'splitClip') {
+      if (clip.kind === 'text') {
+        notes.push(`「${clip.name}」是字幕，不需要切开（直接改时长就行）。`);
+        continue;
+      }
+      const leftDuration = Math.round(action.atMs - clip.start);
+      const rightDuration = Math.round(clip.start + clip.duration - action.atMs);
+      if (leftDuration < 100 || rightDuration < 100) {
+        notes.push(
+          `切点 ${seconds(action.atMs)} 不在「${clip.name}」（${seconds(clip.start)}–${seconds(clip.start + clip.duration)}）内部，或两侧不足 0.1s，这条已跳过。`,
+        );
+        continue;
+      }
+      // 前段只改时长（自然保留淡入），后段新建一个片段：素材内入点往后推同样长度
+      actions.push({ type: 'updateClip', trackId: located.trackId, clipId: clip.id, patch: { duration: leftDuration } });
+      actions.push({
+        type: 'addClip',
+        trackId: located.trackId,
+        clip: {
+          name: clip.name,
+          kind: clip.kind,
+          start: Math.round(action.atMs),
+          duration: rightDuration,
+          offset: Math.round(clip.offset + leftDuration),
+          hue: clip.hue,
+          assetPath: clip.assetPath,
+          volume: clip.volume,
+          muted: clip.muted,
+          fadeOutMs: clip.fadeOutMs,
+        },
+      });
+      lines.push(`在 ${seconds(action.atMs)} 处把「${clip.name}」切成两段`);
+      continue;
+    }
+
     if (action.type === 'removeClip') {
       actions.push({ type: 'removeClip', trackId: located.trackId, clipId: located.clipId });
       lines.push(
@@ -217,5 +288,5 @@ export function translatePlan(
     lines.push(`修改「${clip.name}」→ ${changes}`);
   }
 
-  return { actions, lines, notes, seekMs };
+  return { actions, lines, notes, seekMs, inserts, undo };
 }

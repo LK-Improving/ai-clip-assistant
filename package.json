@@ -25,6 +25,9 @@
     "bench:metrics": "node scripts/bench/metrics.mjs",
     "vision:warmup": "node scripts/vision/warmup.mjs",
     "typecheck": "pnpm -r typecheck",
+    "check:render": "pnpm --filter @miaoma/desktop check:render",
+    "smoke": "pnpm --filter @miaoma/desktop smoke",
+    "smoke:agent": "pnpm --filter @miaoma/desktop smoke:agent",
     "prepare": "husky"
   },
   "devDependencies": {

@@ -29,7 +29,13 @@ export type AssistantAction =
       };
     }
   | { type: 'addCaption'; text: string; startMs: number; durationMs: number }
-  | { type: 'seekTo'; startMs: number };
+  | { type: 'seekTo'; startMs: number }
+  /** 在时间线绝对位 atMs 处把片段切成两段 */
+  | { type: 'splitClip'; ref: string; atMs: number }
+  /** 按描述去素材库检索并插入（检索与选件由渲染进程负责） */
+  | { type: 'insertAsset'; query: string; startMs?: number; kind?: 'video' | 'audio' | 'text' }
+  /** 回退上一次批量改动 */
+  | { type: 'undo' };
 
 export interface AssistantClipSnapshot {
   ref: string;
@@ -51,7 +57,7 @@ export interface EditPlan {
   actions: AssistantAction[];
 }
 
-const ACTION_TYPES = ['removeClip', 'updateClip', 'addCaption', 'seekTo'] as const;
+const ACTION_TYPES = ['removeClip', 'updateClip', 'addCaption', 'seekTo', 'splitClip', 'insertAsset', 'undo'] as const;
 
 const PLAN_TOOL_SCHEMA = {
   type: 'object',
@@ -64,7 +70,9 @@ const PLAN_TOOL_SCHEMA = {
         properties: {
           type: { type: 'string', enum: [...ACTION_TYPES] },
           ref: { type: 'string', description: '目标片段引用，必须逐字来自快照，如「音乐轨#2」或「选中」' },
-          text: { type: 'string', description: 'addCaption 的字幕文本' },
+          text: { type: 'string', description: 'addCaption 的字幕文本 / insertAsset 的检索描述（query 的别名）' },
+          query: { type: 'string', description: 'insertAsset：去素材库找什么，用自然语言描述画面' },
+          kind: { type: 'string', enum: ['video', 'audio', 'text'], description: 'insertAsset：期望素材类型，缺省 video' },
           startMs: { type: 'number', description: '时间线起点（毫秒）' },
           durationMs: { type: 'number', description: '时长（毫秒）' },
           patch: { type: 'object', description: 'updateClip 的字段补丁（startMs/durationMs/offsetMs/volume/muted/fadeInMs/fadeOutMs）' },
@@ -105,6 +113,25 @@ export function parseEditPlan(value: unknown): EditPlan {
       const startMs = num(a.startMs, 'seekTo.startMs');
       if (startMs === undefined) throw new Error('seekTo 缺少 startMs');
       return { type: 'seekTo', startMs: Math.max(0, Math.round(startMs)) };
+    }
+    if (type === 'undo') return { type: 'undo' };
+    if (type === 'insertAsset') {
+      const query = (typeof a.query === 'string' && a.query.trim()) || (typeof a.text === 'string' ? a.text.trim() : '');
+      if (!query) throw new Error('insertAsset 缺少 query（用自然语言描述想要什么画面）');
+      const startMs = num(a.startMs, 'insertAsset.startMs');
+      const kind = a.kind === 'audio' || a.kind === 'text' || a.kind === 'video' ? a.kind : undefined;
+      return {
+        type: 'insertAsset',
+        query,
+        ...(startMs !== undefined ? { startMs: Math.max(0, Math.round(startMs)) } : {}),
+        ...(kind ? { kind } : {}),
+      };
+    }
+    if (type === 'splitClip') {
+      const ref = requireRef(a.ref, index);
+      const atMs = num(a.atMs ?? a.startMs, 'splitClip.atMs');
+      if (atMs === undefined) throw new Error('splitClip 缺少 atMs（时间线上的绝对切点，毫秒）');
+      return { type: 'splitClip', ref, atMs: Math.max(0, Math.round(atMs)) };
     }
     if (type === 'addCaption') {
       const text = typeof a.text === 'string' ? a.text.trim() : '';
@@ -166,7 +193,9 @@ export async function planEdits(opts: {
     '(5) 只做用户要求的事，不要顺手改别的片段；' +
     '(6) 输出 JSON：{reply:"中文说明", actions:[...]}，reply 简述你将怎么做。' +
     '可用动作：removeClip{ref} / updateClip{ref,patch{startMs,durationMs,offsetMs,volume(0-2),muted,fadeInMs,fadeOutMs}} / ' +
-    'addCaption{text,startMs,durationMs} / seekTo{startMs}。';
+    'addCaption{text,startMs,durationMs} / seekTo{startMs} / splitClip{ref,atMs} / ' +
+    'insertAsset{query,startMs?,kind?} / undo{}。' +
+    'splitClip 的 atMs 是时间线上的绝对切点；insertAsset 只负责“去素材库找什么”，选件由本地完成，不确定时也可以用。';
   const user = JSON.stringify({ message: opts.message, timeline: snapshotForPrompt(opts.snapshot) });
 
   return invokeStructured<EditPlan>({

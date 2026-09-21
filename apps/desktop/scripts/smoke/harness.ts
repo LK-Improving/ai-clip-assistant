@@ -60,6 +60,7 @@ import { probeMedia } from '../../src/main/services/probe';
 import { createAgentDeps, resumeAgentRun, retryAgentRun, startAgentRun } from '../../src/main/services/agent';
 import { HttpTaskVideoProvider, MiniMaxH3VideoProvider, NODE_RUNNERS, listRemoteModelIds, minimaxAlternateBase, parseEditPlan, toVideoGenError } from '@miaoma/agent';
 import { buildTimelineSnapshot, resolveClipRef, translatePlan } from '../../src/lib/assistant-apply';
+import { applyTimelineActions, canUndo, getTracks, undoTimeline } from '../../src/lib/timeline-store';
 import type { TimelineClip, TimelineTrack } from '../../src/lib/timeline-utils';
 import type { AgentDeps, AgentState } from '@miaoma/agent';
 import { loadVideoGenConfig, saveVideoGenConfig } from '../../src/main/services/video-gen/config';
@@ -1608,7 +1609,48 @@ function ringAssistantPlan(results: RingResult[]): void {
     }
     if (!/缺少 ref/.test(threw)) throw new Error(`缺 ref 应被拒，实际：${threw || '未抛错'}`);
 
-    results.push(ok(name, '快照按时间编号 / 四种 ref 写法解析 / 动作与摘要同源 / 幻觉 ref 逐条跳过 / 非法计划抛错重试'));
+    // splitClip：切点合法时展开成「改前段时长 + 新增后段」，素材内入点同步往后推
+    const splitPlan = parseEditPlan({ reply: '切开', actions: [{ type: 'splitClip', ref: '音乐轨#1', atMs: 1000 }] });
+    const splitT = translatePlan(splitPlan, tracks, selection);
+    if (splitT.actions.length !== 2) throw new Error(`切分应产出 2 个动作，实际 ${splitT.actions.length}`);
+    const second = splitT.actions.find((a) => a.type === 'addClip');
+    if (!second || second.type !== 'addClip' || second.clip.start !== 1000 || second.clip.offset !== 1000 || second.clip.duration !== 1000) {
+      throw new Error(`后段入点/起点映射异常：${JSON.stringify(second)}`);
+    }
+    const badSplit = translatePlan(parseEditPlan({ reply: 'x', actions: [{ type: 'splitClip', ref: '音乐轨#1', atMs: 9000 }] }), tracks, selection);
+    if (badSplit.actions.length !== 0 || !badSplit.notes.length) throw new Error('越界切点应跳过并给原因');
+
+    // insertAsset：无目标轨道给人话提示；有则进待检索队列（同步阶段不产动作）
+    const noTrack = translatePlan(parseEditPlan({ reply: 'x', actions: [{ type: 'insertAsset', query: '海边的日落' }] }), tracks, selection);
+    if (noTrack.inserts.length !== 0 || !noTrack.notes.some((n) => /没有视频轨/.test(n))) {
+      throw new Error('无视频轨时 insertAsset 应给可行动提示');
+    }
+    const withInsert = translatePlan(
+      parseEditPlan({ reply: 'x', actions: [{ type: 'insertAsset', query: '海边的日落', kind: 'audio' }] }),
+      tracks,
+      selection,
+    );
+    if (withInsert.inserts.length !== 1 || withInsert.inserts[0]?.kind !== 'audio' || withInsert.actions.length !== 0) {
+      throw new Error('insertAsset 未进入待检索队列');
+    }
+    const undoPlan = translatePlan(parseEditPlan({ reply: '撤销', actions: [{ type: 'undo' }] }), tracks, selection);
+    if (!undoPlan.undo || undoPlan.lines.length !== 1) throw new Error('undo 动作未翻译');
+
+    // 撤销栈：整批改动一次回退（对话式剪辑的安全网）；全部被跳过的批次不入栈
+    const before = getTracks();
+    applyTimelineActions([{ type: 'replaceTracks', tracks: [{ id: 't-probe', kind: 'video', name: '视频轨', clips: [] }] }]);
+    applyTimelineActions([
+      { type: 'addClip', trackId: 't-probe', clip: { name: 'probe', kind: 'video', start: 0, duration: 1000, offset: 0, hue: 1 } },
+    ]);
+    if (!canUndo()) throw new Error('改动后应可撤销');
+    const undone = undoTimeline();
+    if (!undone || undone.clips !== 0) throw new Error(`撤销后应回到 0 片段，实际 ${undone?.clips}`);
+    if (undoTimeline() === null) throw new Error('应还能再退一步回到初始快照');
+    if (getTracks().length !== before.length) throw new Error('撤销到底应回到初始轨道数');
+    applyTimelineActions([{ type: 'removeClip', trackId: 'no-such-track', clipId: 'no-such-clip' }]);
+    if (canUndo()) throw new Error('全部跳过的批次不应压撤销栈');
+
+    results.push(ok(name, '快照按时间编号 / 四种 ref 写法解析 / 切分与插件展开 / 幻觉 ref 逐条跳过 / 非法计划抛错重试 / 批量改动能整批撤销'));
   } catch (e) {
     results.push(fail(name, (e as Error).message));
   }

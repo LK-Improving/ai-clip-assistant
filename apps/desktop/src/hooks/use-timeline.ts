@@ -2,12 +2,14 @@ import { useCallback, useEffect, useSyncExternalStore } from 'react';
 import type { AssetMetaHint } from '@/lib/project-bridge';
 import {
   applyTimelineActions,
+  canUndo,
   getSaveState,
   getSelection,
   getTracks,
   setAssetHintsProvider,
   setSelection,
   subscribeTimeline,
+  undoTimeline,
   type SaveState,
   type TimelineAction,
   type TimelineSelection,
@@ -38,6 +40,13 @@ export function useTimelineSaveState(): SaveState {
 export function useApplyTimeline(): (actions: TimelineAction[]) => ReturnType<typeof applyTimelineActions> {
   return useCallback((actions: TimelineAction[]) => applyTimelineActions(actions), []);
 }
+
+/** 当前能不能撤销（控制「撤销」按钮置灰） */
+export function useCanUndo(): boolean {
+  return useSyncExternalStore(subscribeTimeline, canUndo, canUndo);
+}
+
+export { undoTimeline };
 
 /**
  * 注册素材元数据来源（时长 / 分辨率 / 是否含音轨）。

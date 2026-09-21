@@ -12,6 +12,7 @@
     "make": "node scripts/forge.cjs make",
     "publish": "node scripts/forge.cjs publish",
     "typecheck": "tsc --noEmit",
+    "check:render": "node scripts/smoke/render-check.mjs",
     "smoke": "node scripts/smoke/run.mjs",
     "smoke:agent": "node scripts/smoke/agent-run.mjs"
   },
