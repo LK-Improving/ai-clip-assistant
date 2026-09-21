@@ -50,6 +50,16 @@ export interface TimelineClip {
   fadeInMs?: number;
   /** 淡出时长（毫秒）：同 fadeInMs，按轨道类型分写 */
   fadeOutMs?: number;
+  /** 缩放倍率（0.1–3 常用区间，schema 允许 ≤20）；缺省沿用工程既有 transform */
+  scale?: number;
+  /** 旋转角度（度，-360..360） */
+  rotation?: number;
+  /** 不透明度 0–1（<1 时渲染层走 colorchannelmixer=aa） */
+  opacity?: number;
+  /** 音量倍率 0–2（视频片段同时决定自带音轨音量） */
+  volume?: number;
+  /** 静音（视频片段：不参与混音；音频片段：音量归零） */
+  muted?: boolean;
   /** 字幕 / 文本内容（仅 kind === 'text' 时有效） */
   content?: string;
   /** 字幕 / 文本样式（仅 kind === 'text' 时有效） */
@@ -69,6 +79,21 @@ export function totalDuration(tracks: TimelineTrack[]): number {
       track.clips.reduce((m, clip) => Math.max(m, clip.start + clip.duration), max),
     0,
   );
+}
+
+/** 空工程兜底标尺：一个片段都没有时也给出可拖拽/可预览的时间范围 */
+export const EMPTY_TIMELINE_MS = 30_000;
+
+/**
+ * 时间线总时长（单一口径）：以内容末尾为准，仅空轨道时退化为兜底长度。
+ *
+ * 预览控制条与时间线底部必须共用本函数：之前两处各自兜底（预览 30s、时间线 5s），
+ * 一个 10s 的作品在预览区显示成「00:00 / 00:30」，与右下角「总时长 00:10」对不上，
+ * 而且播放头会在内容结束后继续空跑 20 秒。
+ */
+export function timelineTotalMs(tracks: TimelineTrack[]): number {
+  const content = totalDuration(tracks);
+  return content > 0 ? content : EMPTY_TIMELINE_MS;
 }
 
 /** 拖拽吸附：贴近 0 点或邻居片段边缘时对齐（阈值 200ms 屏幕时间） */

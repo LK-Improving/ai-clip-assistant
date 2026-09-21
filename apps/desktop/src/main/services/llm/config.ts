@@ -7,7 +7,7 @@ import { app } from 'electron';
  * 参照 tts/config.ts 的模式，缺文件或解析失败时回退默认值，避免启动时崩溃。
  */
 
-export type LlmProviderId = 'offline' | 'ark' | 'ollama';
+export type LlmProviderId = 'offline' | 'ark' | 'ollama' | 'custom';
 
 export interface ArkLlmConfig {
   apiKey: string;
@@ -24,11 +24,20 @@ export interface OllamaLlmConfig {
   model: string;
 }
 
+export interface CustomLlmConfig {
+  /** OpenAI 兼容接入点根路径（如 https://api.deepseek.com/v1） */
+  baseUrl: string;
+  apiKey: string;
+  /** 模型 id 以服务商控制台为准（如 deepseek-chat / deepseek-reasoner） */
+  model: string;
+}
+
 export interface LlmConfig {
-  /** offline = 内置确定性 Provider（无需联网）；ark = 火山方舟；ollama = 本地 Ollama 服务 */
+  /** offline=内置确定性；ark=火山方舟；ollama=本地 Ollama；custom=任意 OpenAI 兼容端点（DeepSeek 等） */
   active: LlmProviderId;
   ark: ArkLlmConfig;
   ollama: OllamaLlmConfig;
+  custom: CustomLlmConfig;
 }
 
 export const DEFAULT_LLM_CONFIG: LlmConfig = {
@@ -36,11 +45,17 @@ export const DEFAULT_LLM_CONFIG: LlmConfig = {
   ark: {
     apiKey: '',
     model: 'doubao-seed-1-6-250615',
-    baseUrl: 'https://ark.cn-volcengine.com/api/v1/chat/completions',
+    // 火山方舟 OpenAI 兼容接入点根路径（ARK 真实域名；normalizeArkBaseUrl 会兼容历史写全 /chat/completions 的配置）
+    baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
   },
   ollama: {
     baseUrl: 'http://127.0.0.1:11434',
     model: 'qwen2.5:7b',
+  },
+  custom: {
+    baseUrl: 'https://api.deepseek.com/v1',
+    apiKey: '',
+    model: 'deepseek-chat',
   },
 };
 
@@ -58,12 +73,14 @@ export function loadLlmConfig(): LlmConfig {
       ark: { ...DEFAULT_LLM_CONFIG.ark, ...raw.ark },
       // 旧配置文件无 ollama 字段：用默认值补齐，不强迫用户重建配置
       ollama: { ...DEFAULT_LLM_CONFIG.ollama, ...raw.ollama },
+      custom: { ...DEFAULT_LLM_CONFIG.custom, ...raw.custom },
     };
   } catch {
     return {
       ...DEFAULT_LLM_CONFIG,
       ark: { ...DEFAULT_LLM_CONFIG.ark },
       ollama: { ...DEFAULT_LLM_CONFIG.ollama },
+      custom: { ...DEFAULT_LLM_CONFIG.custom },
     };
   }
 }
@@ -78,6 +95,9 @@ export function isLlmConfigured(config: LlmConfig = loadLlmConfig()): boolean {
   if (config.active === 'ollama') {
     // 本机服务：选了就算可用；连接失败由 invokeStructured 的重试/降级兜底接住
     return Boolean(config.ollama?.baseUrl || process.env.OLLAMA_BASE_URL);
+  }
+  if (config.active === 'custom') {
+    return Boolean(config.custom?.apiKey && config.custom?.baseUrl);
   }
   return Boolean(config.ark.apiKey || process.env.ARK_API_KEY);
 }

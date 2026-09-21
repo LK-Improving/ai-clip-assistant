@@ -117,6 +117,29 @@ function writeFadeEffects(base: Effect[], fadeInMs?: number, fadeOutMs?: number)
   return out;
 }
 
+/**
+ * core → UI：读片段变换/音量状态（属性面板真实接线，M6 后续补实）。
+ * 字段全部显式给出，面板滑块直接受控于工程值。
+ */
+function readClipVisualState(clip: Clip): Partial<TimelineClip> {
+  if (clip.type === 'video' || clip.type === 'image') {
+    const visual: Partial<TimelineClip> = {
+      scale: clip.transform.scale,
+      rotation: clip.transform.rotation,
+      opacity: clip.transform.opacity,
+    };
+    if (clip.type === 'video') {
+      visual.volume = clip.volume;
+      visual.muted = clip.muted;
+    }
+    return visual;
+  }
+  if (clip.type === 'audio') {
+    return { volume: clip.volume, muted: clip.muted };
+  }
+  return {};
+}
+
 /** 工程 → 编辑器时间线 */
 export function projectToTimeline(project: Project): TimelineTrack[] {
   const assetById = new Map(project.assets.map((asset) => [asset.id, asset]));
@@ -158,6 +181,7 @@ export function projectToTimeline(project: Project): TimelineTrack[] {
         content: clip.type === 'text' ? clip.content : undefined,
         textStyle,
         ...readFade(clip),
+        ...readClipVisualState(clip),
       };
     });
 
@@ -281,8 +305,9 @@ export function timelineToProject(
           ...carried,
           type: 'audio',
           assetId,
-          volume: prevAudio?.volume ?? 1,
-          muted: prevAudio?.muted ?? false,
+          // 音量/静音：UI 提供则覆盖，未提供沿用工程既有值（保存往返不漂移）
+          volume: Math.min(2, Math.max(0, clip.volume ?? prevAudio?.volume ?? 1)),
+          muted: clip.muted ?? prevAudio?.muted ?? false,
           // 音频淡入淡出走原生 fade 字段；UI 未提供时保留既有值
           fade: {
             fadeIn: Math.max(0, Math.round(clip.fadeInMs ?? prevAudio?.fade?.fadeIn ?? 0)),
@@ -291,25 +316,37 @@ export function timelineToProject(
         });
       } else if (type === 'image') {
         const prevImage = prev && prev.type === 'image' ? prev : undefined;
+        const baseImageTransform = prevImage?.transform ?? DEFAULT_TRANSFORM;
         clips.push({
           ...common,
           ...carried,
           effects: writeFadeEffects(carried.effects, clip.fadeInMs, clip.fadeOutMs),
           type: 'image',
           assetId,
-          transform: prevImage?.transform ?? DEFAULT_TRANSFORM,
+          transform: {
+            ...baseImageTransform,
+            scale: Math.min(20, Math.max(0.01, clip.scale ?? baseImageTransform.scale)),
+            rotation: Math.min(360, Math.max(-360, clip.rotation ?? baseImageTransform.rotation)),
+            opacity: Math.min(1, Math.max(0, clip.opacity ?? baseImageTransform.opacity)),
+          },
         });
       } else {
         const prevVideo = prev && prev.type === 'video' ? prev : undefined;
+        const baseVideoTransform = prevVideo?.transform ?? DEFAULT_TRANSFORM;
         clips.push({
           ...common,
           ...carried,
           effects: writeFadeEffects(carried.effects, clip.fadeInMs, clip.fadeOutMs),
           type: 'video',
           assetId,
-          transform: prevVideo?.transform ?? DEFAULT_TRANSFORM,
-          volume: prevVideo?.volume ?? 1,
-          muted: prevVideo?.muted ?? false,
+          transform: {
+            ...baseVideoTransform,
+            scale: Math.min(20, Math.max(0.01, clip.scale ?? baseVideoTransform.scale)),
+            rotation: Math.min(360, Math.max(-360, clip.rotation ?? baseVideoTransform.rotation)),
+            opacity: Math.min(1, Math.max(0, clip.opacity ?? baseVideoTransform.opacity)),
+          },
+          volume: Math.min(2, Math.max(0, clip.volume ?? prevVideo?.volume ?? 1)),
+          muted: clip.muted ?? prevVideo?.muted ?? false,
         });
       }
     }

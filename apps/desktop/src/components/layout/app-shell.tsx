@@ -9,6 +9,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import type { ReactNode } from 'react';
+import { AssistantDock } from '@/components/assistant/assistant-dock';
 import { cn } from '@/lib/utils';
 
 const navItems = [
@@ -24,7 +25,7 @@ const bottomItems = [
   { to: '/settings', label: '设置中心', icon: Settings },
 ];
 
-/** 应用外壳：左侧图标导航 + 顶栏（对照设计稿 02/06/10 等页面） */
+/** 应用外壳：左侧图标导航 + 顶栏 + 右缘常驻 AI 助手浮层（对照设计稿 02/06/10 等页面） */
 export function AppShell({ route, children }: { route: string; children: ReactNode }) {
   return (
     <div className="flex h-screen overflow-hidden">
@@ -107,6 +108,9 @@ export function AppShell({ route, children }: { route: string; children: ReactNo
           {children}
         </main>
       </div>
+
+      {/* 浮层定位（fixed），展开时不挤压编辑器/时间线布局；形态由当前路由决定 */}
+      <AssistantDock route={route} />
     </div>
   );
 }

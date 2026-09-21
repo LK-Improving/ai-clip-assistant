@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { BrowserWindow, app, protocol, shell } from 'electron';
 import { registerIpc } from './main/ipc';
+import { resolveFfmpegPath } from './main/ffmpeg';
 import { addAllowedPath, registerProtocols } from './main/protocol';
 
 /** M1.3 启动基线：进程时间原点（performance.timeOrigin = Electron 进程启动瞬间） */
@@ -65,6 +66,8 @@ void app.whenReady().then(() => {
   addAllowedPath(app.getPath('userData'));
   registerIpc();
   createWindow();
+  // 预览代理/导出都依赖具体是哪个 ffmpeg（剪映裁剪版无 libx264），开屏先报一行便于排查
+  console.log(`[ffmpeg] 解析结果：${resolveFfmpegPath() ?? '未找到（预览代理与导出将不可用）'}`);
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

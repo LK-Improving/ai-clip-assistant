@@ -76,6 +76,20 @@ export default function ExportProgressPage() {
     if (pending) window.electronAPI?.shell?.openPath(pending.dir);
   };
 
+  /**
+   * 离开进度页：必须同时清掉待导出请求并导航。
+   * 只 clearPendingExport() 会让本页停在 done 态不跳转，表现为「点完成没反应」。
+   */
+  const backToEditor = () => {
+    clearPendingExport();
+    window.location.hash = '#/editor';
+  };
+
+  /** 失败/取消后回到导出设置页重新发起（pending 未清，参数还在） */
+  const retryExport = () => {
+    window.location.hash = '#/export';
+  };
+
   const stageState = (index: number): 'done' | 'running' | 'todo' => {
     if (status === 'done') return 'done';
     const activeIndex =
@@ -165,9 +179,23 @@ export default function ExportProgressPage() {
               <FolderOpen className="size-4" /> 打开所在文件夹
             </Button>
           )}
+          {(status === 'error' || status === 'cancelled') && pending && (
+            <Button className="rounded-full" onClick={retryExport}>
+              重新导出
+            </Button>
+          )}
           {status === 'done' && (
-            <Button variant="ghost" className="rounded-full" onClick={() => clearPendingExport()}>
+            <Button variant="ghost" className="rounded-full" onClick={backToEditor}>
               完成
+            </Button>
+          )}
+          {/* 失败/取消/空态/浏览器模式也得给个出口，否则只能卡在进度页 */}
+          {(status === 'error' ||
+            status === 'cancelled' ||
+            status === 'empty' ||
+            status === 'nobridge') && (
+            <Button variant="ghost" className="rounded-full" onClick={backToEditor}>
+              返回编辑器
             </Button>
           )}
         </div>

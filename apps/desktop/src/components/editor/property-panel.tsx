@@ -29,15 +29,40 @@ const FALLBACK_TEXT_STYLE: SubtitleStyle = {
   y: 0.9,
 };
 
-const sliderRow = (label: string, value: string, fill = 'w-2/3') => (
-  <div className="flex items-center gap-2">
-    <span className="w-8 shrink-0 text-[11px] text-muted-foreground">{label}</span>
-    <div className="h-1 flex-1 rounded-full bg-secondary">
-      <div className={`bg-brand h-1 rounded-full ${fill}`} />
+/** 真实受控滑块：写入片段字段并经 onClipChange → bridge → 工程/渲染生效 */
+function LiveSlider({
+  label,
+  min,
+  max,
+  step,
+  value,
+  display,
+  onChange,
+}: {
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  display: string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-12 shrink-0 text-[11px] text-muted-foreground">{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+        className="flex-1 accent-[hsl(var(--brand))]"
+      />
+      <span className="w-12 shrink-0 text-right font-mono text-[10px]">{display}</span>
     </div>
-    <span className="w-12 shrink-0 text-right font-mono text-[10px]">{value}</span>
-  </div>
-);
+  );
+}
 
 const fieldLabel = 'mb-2 text-[11px] font-medium text-muted-foreground';
 
@@ -272,21 +297,62 @@ export function PropertyPanel({
                   </div>
                 </div>
 
-                <div>
-                  <p className={fieldLabel}>变换</p>
-                  <div className="space-y-2">
-                    {sliderRow('缩放', '100%')}
-                    {sliderRow('旋转', '0°', 'w-1/2')}
-                    {sliderRow('不透明', '100%')}
+                {trackKind === 'video' ? (
+                  <div>
+                    <p className={fieldLabel}>变换</p>
+                    <div className="space-y-2">
+                      <LiveSlider
+                        label="缩放"
+                        min={0.1}
+                        max={3}
+                        step={0.05}
+                        value={clip.scale ?? 1}
+                        display={`${Math.round((clip.scale ?? 1) * 100)}%`}
+                        onChange={(v) => onClipChange({ scale: v })}
+                      />
+                      <LiveSlider
+                        label="旋转"
+                        min={-180}
+                        max={180}
+                        step={1}
+                        value={clip.rotation ?? 0}
+                        display={`${clip.rotation ?? 0}°`}
+                        onChange={(v) => onClipChange({ rotation: v })}
+                      />
+                      <LiveSlider
+                        label="不透明"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={clip.opacity ?? 1}
+                        display={`${Math.round((clip.opacity ?? 1) * 100)}%`}
+                        onChange={(v) => onClipChange({ opacity: v })}
+                      />
+                    </div>
                   </div>
-                </div>
+                ) : null}
 
                 <div>
                   <p className={fieldLabel}>音频</p>
-                  <div className="space-y-2">{sliderRow('音量', '100%')}</div>
+                  <LiveSlider
+                    label="音量"
+                    min={0}
+                    max={2}
+                    step={0.05}
+                    value={clip.volume ?? 1}
+                    display={`${Math.round((clip.volume ?? 1) * 100)}%`}
+                    onChange={(v) => onClipChange({ volume: v })}
+                  />
                   <div className="mt-2 flex items-center justify-between rounded-lg border p-2.5">
                     <span className="text-[11px]">静音</span>
-                    <Switch />
+                    <button
+                      type="button"
+                      onClick={() => onClipChange({ muted: !(clip.muted ?? false) })}
+                      aria-pressed={clip.muted ?? false}
+                      title={clip.muted ? '取消静音' : '静音该片段'}
+                    >
+                      <Switch checked={clip.muted ?? false} />
+                    </button>
                   </div>
                 </div>
               </>

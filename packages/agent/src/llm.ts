@@ -206,8 +206,39 @@ export class OllamaChatModel extends ChatOllama {
   }
 }
 
+/**
+ * 自定义 OpenAI 兼容模型（P-自定义）：DeepSeek / 任意兼容网关。
+ * DeepSeek 官方即 OpenAI 协议（https://api.deepseek.com/v1）且支持 tools，
+ * 因此与方舟同走 bindTools Function Calling 链路；模型 id 以用户控制台显示为准填入 model。
+ */
+export class CustomChatModel extends ChatOpenAI {
+  readonly providerId = 'custom';
+  readonly label: string;
+  private readonly keyValue: string;
+
+  constructor(opts: { apiKey: string; baseUrl: string; model?: string; label?: string }) {
+    super({
+      apiKey: opts.apiKey,
+      model: opts.model ?? 'gpt-4o-mini',
+      temperature: 0.7,
+      maxTokens: 2048,
+      configuration: { baseURL: normalizeArkBaseUrl(opts.baseUrl) },
+    });
+    this.keyValue = opts.apiKey;
+    this.label = opts.label ?? `自定义 ${opts.model ?? 'OpenAI 兼容'}`;
+  }
+
+  isConfigured(): boolean {
+    return this.keyValue.length > 0;
+  }
+
+  supportsToolCalling(): boolean {
+    return true;
+  }
+}
+
 export interface LlmProviderConfig {
-  type?: 'offline' | 'ark' | 'ollama';
+  type?: 'offline' | 'ark' | 'ollama' | 'custom';
   apiKey?: string;
   model?: string;
   baseUrl?: string;
@@ -216,7 +247,14 @@ export interface LlmProviderConfig {
 /** 根据配置/env 创建聊天模型；默认离线。与 createLLM 别名保持对外兼容 */
 export function createLlmProvider(config: LlmProviderConfig = {}): AgentChatModel {
   const type =
-    config.type ?? (process.env.AGENT_LLM_PROVIDER as 'offline' | 'ark' | 'ollama' | undefined) ?? 'offline';
+    config.type ?? (process.env.AGENT_LLM_PROVIDER as 'offline' | 'ark' | 'ollama' | 'custom' | undefined) ?? 'offline';
+  if (type === 'custom') {
+    return new CustomChatModel({
+      apiKey: config.apiKey ?? process.env.CUSTOM_LLM_API_KEY ?? '',
+      baseUrl: config.baseUrl ?? process.env.CUSTOM_LLM_BASE_URL ?? 'https://api.deepseek.com/v1',
+      model: config.model ?? process.env.CUSTOM_LLM_MODEL,
+    });
+  }
   if (type === 'ark') {
     return new ArkChatModel({
       apiKey: config.apiKey ?? process.env.ARK_API_KEY ?? '',

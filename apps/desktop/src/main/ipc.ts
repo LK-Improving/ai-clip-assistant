@@ -15,7 +15,9 @@ import { synthesizeSpeech, ttsStatus } from './services/tts';
 import type { TtsConfig } from './services/tts/config';
 import type { Project } from '@miaoma/video-project';
 import type { StoryboardScene } from '@miaoma/agent';
+import { listRemoteModelIds } from '@miaoma/agent';
 import { cancelAgentRun, getAgentStatus, resumeAgentRun, retryAgentRun, startAgentRun } from './services/agent';
+import { planAssistantEdit } from './services/assistant';
 import { addVoice, listVoices, removeVoice } from './services/voice';
 import { visionStatus } from './services/vision';
 import {
@@ -125,8 +127,10 @@ export function registerIpc(): void {
   /** 预览加载失败时用来解释原因（文件缺失 / 路径未授权），避免黑屏无从排查 */
   ipcMain.handle('media:diagnose', (_event, filePath: string) => explainAccess(filePath));
 
-  /** 确保素材可被 <video> 播放：不支持的内编码按需转码为 H.264 代理（缓存复用） */
-  ipcMain.handle('media:playable', async (_event, filePath: string) => ensurePlayable(filePath));
+  /** 确保素材可被 <video> 播放：不支持的编码按需转码为 H.264 代理（缓存复用）；force 预览失败自动降级强制代理 */
+  ipcMain.handle('media:playable', async (_event, filePath: string, force?: boolean) =>
+    ensurePlayable(String(filePath ?? ''), Boolean(force)),
+  );
 
   // ---- 工程持久化：create / get / save / list / remove ----
   ipcMain.handle('project:list', () => getProjectStore().list());
@@ -272,6 +276,14 @@ export function registerIpc(): void {
     return { active: config.active, configured: isLlmConfigured(config) };
   });
 
+  /**
+   * AI 助手：自然语言 → 时间线改动计划。
+   * 主进程只出计划不改状态，ref 解析与执行在渲染进程 store（单一事实源）。
+   */
+  ipcMain.handle('assistant:plan', (_event, input: Parameters<typeof planAssistantEdit>[0]) =>
+    planAssistantEdit(input),
+  );
+
   // ===== 视频生成模型（阶段五补充，2026-09-15） =====
   ipcMain.handle('videoGen:get-config', () => loadVideoGenConfig());
   ipcMain.handle('videoGen:set-config', (_event, config: VideoGenConfig) => {
@@ -282,4 +294,32 @@ export function registerIpc(): void {
     const config = loadVideoGenConfig();
     return { active: config.active, configured: isVideoGenConfigured(config) };
   });
+
+  /**
+   * 拉取接入点可用的视频模型 id（方舟 id 是小写带日期版本，手填几乎必错）。
+   * 不传参数则用已保存的配置；传了则用表单当前值（支持“没保存先试一下”）。
+   */
+  ipcMain.handle(
+    'videoGen:list-models',
+    async (_event, opts?: { apiKey?: string; baseUrl?: string }) => {
+      const cfg = loadVideoGenConfig();
+      const source = cfg.active === 'custom' ? cfg.custom : cfg.seedance;
+      const baseUrl = String(opts?.baseUrl ?? source.baseUrl ?? '').trim();
+      const apiKey = String(opts?.apiKey ?? source.apiKey ?? '').trim();
+      if (!baseUrl) return { ok: false, models: [] as string[], error: '接入点为空，请先填写接入点' };
+      try {
+        const models = await listRemoteModelIds({ baseUrl, apiKey });
+        if (!models.length) {
+          return {
+            ok: false,
+            models,
+            error: '接入点未返回可用的视频模型 id（方舟需先在控制台开通模型服务）',
+          };
+        }
+        return { ok: true, models, error: undefined as string | undefined };
+      } catch (e) {
+        return { ok: false, models: [] as string[], error: (e as Error).message };
+      }
+    },
+  );
 }

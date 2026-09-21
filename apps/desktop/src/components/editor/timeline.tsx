@@ -5,7 +5,7 @@ import {
   formatTimecode,
   snapStart,
   tickInterval,
-  totalDuration,
+  timelineTotalMs,
   type TimelineClip,
   type TimelineTrack,
 } from '@/lib/timeline-utils';
@@ -59,7 +59,8 @@ export function Timeline({
   // 以滚动容器可见宽度（减去左侧轨道头 6rem = 96px）为基准换算像素比例，
   // 这样即便横向放大、内容超出视口，pxPerMs 仍稳定，不会出现循环依赖。
   const HEADER_W = 96;
-  const totalMs = Math.max(totalDuration(tracks), 5000);
+  // 总时长与预览控制条共用单一口径（timelineTotalMs），避免两处数字对不上
+  const totalMs = timelineTotalMs(tracks);
   const visibleMs = Math.max(2000, totalMs / zoom);
   const pxPerMs = laneWidth / visibleMs;
   const msToPx = (ms: number) => ms * pxPerMs;

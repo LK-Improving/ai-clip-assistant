@@ -30,7 +30,10 @@ import { timelineToProject } from '../../src/lib/project-bridge';
 import { EMBED_DIMS, applyAutoTransitions, embedAsset } from '@miaoma/agent';
 import { embedImage, visionStatus } from '../../src/main/services/vision';
 import { createEmptyProject, createId, DEFAULT_TRANSFORM, migrateProject, nowIso, ProjectSchema } from '@miaoma/video-project';
+import type { VideoClip } from '@miaoma/video-project';
+import { projectToTimeline } from '../../src/lib/project-bridge';
 import { generateThumbnail } from '../../src/main/services/thumbnail';
+import { ensurePlayable } from '../../src/main/services/preview';
 import { saveTtsConfig, loadTtsConfig } from '../../src/main/services/tts/config';
 import {
   renderProject,
@@ -55,6 +58,11 @@ import {
 import { resolveFfmpegPath } from '../../src/main/ffmpeg';
 import { probeMedia } from '../../src/main/services/probe';
 import { createAgentDeps, resumeAgentRun, retryAgentRun, startAgentRun } from '../../src/main/services/agent';
+import { HttpTaskVideoProvider, MiniMaxH3VideoProvider, NODE_RUNNERS, listRemoteModelIds, minimaxAlternateBase, parseEditPlan, toVideoGenError } from '@miaoma/agent';
+import { buildTimelineSnapshot, resolveClipRef, translatePlan } from '../../src/lib/assistant-apply';
+import type { TimelineClip, TimelineTrack } from '../../src/lib/timeline-utils';
+import type { AgentDeps, AgentState } from '@miaoma/agent';
+import { loadVideoGenConfig, saveVideoGenConfig } from '../../src/main/services/video-gen/config';
 import { isLlmConfigured, loadLlmConfig, saveLlmConfig } from '../../src/main/services/llm/config';
 
 const FFMPEG = process.env.MIAOMA_FFMPEG || 'ffmpeg';
@@ -336,7 +344,56 @@ async function ringProtocolMatrix(results: RingResult[]): Promise<void> {
     const missingRes = await call(path.join(clip1Dir, 'does-not-exist.mp4'));
     if (missingRes.status !== 404) throw new Error(`缺失文件应为 404，实际 ${missingRes.status}`);
 
-    results.push(ok('预览协议矩阵', '200/206/403/404/416 全部符合预期'));
+    // 6) 真实渲染侧 URL 形态（encodeURIComponent 单段）+ 中文文件名往返（用户故障场景）
+    const zhFile = path.join(clip1Dir, '中文测试--微信版操作视频.mp4');
+    fs.copyFileSync(FIX1, zhFile);
+    const zhUrl = `miaoma:///${encodeURIComponent(zhFile)}`;
+    const zhFull = await handler(new Request(zhUrl));
+    if (zhFull.status !== 200) throw new Error(`中文编码路径应为 200，实际 ${zhFull.status}`);
+    const zhRange = await handler(new Request(zhUrl, { headers: { range: 'bytes=0-9' } }));
+    if (zhRange.status !== 206) throw new Error(`中文编码路径 Range 应为 206，实际 ${zhRange.status}`);
+    fs.rmSync(zhFile, { force: true });
+
+    // 7) forceTranscode：h264 白名单内也强制出 faststart 代理（Chromium 拒播时的自动降级兜底）
+    const play = await ensurePlayable(FIX1, true);
+    if (!play.proxied || !play.path || !fs.existsSync(play.path)) {
+      throw new Error(`强制代理异常：proxied=${play.proxied} note=${play.note ?? ''}`);
+    }
+
+    // 8) 奇数比例素材（AI 生成常见 1344x768）：缩放结果必须强制偶数，
+    //    否则 yuv420p 下 libx264 报「height not divisible by 2」，7 个候选编码器全挂（预览不可用）
+    const oddDir = path.join(BASE, 'odd-ratio');
+    fs.mkdirSync(oddDir, { recursive: true });
+    const oddFile = path.join(oddDir, 'odd-1344x768.mp4');
+    execFileSync(
+      FFMPEG,
+      [
+        '-y',
+        '-f', 'lavfi', '-i', 'testsrc=size=1344x768:rate=24:duration=1',
+        '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-shortest',
+        oddFile,
+      ],
+      { windowsHide: true, stdio: 'ignore' },
+    );
+    addAllowedPath(oddDir);
+    const oddPlay = await ensurePlayable(oddFile, true);
+    if (!oddPlay.proxied || !oddPlay.path) {
+      throw new Error(`奇数比例素材代理失败（scale 未强制偶数？）：${oddPlay.note ?? ''}`);
+    }
+    const oddProxy = await probeMedia(oddPlay.path);
+    if (!oddProxy.width || !oddProxy.height || oddProxy.width % 2 !== 0 || oddProxy.height % 2 !== 0) {
+      throw new Error(`代理尺寸必须为偶数，实际 ${oddProxy.width}x${oddProxy.height}`);
+    }
+
+    results.push(
+      ok(
+        '预览协议矩阵',
+        '200/206/403/404/416 + 中文编码 URL 往返 + 强制 faststart 代理 + 奇数比例素材强制偶数全部符合预期',
+      ),
+    );
   } catch (e) {
     results.push(fail('预览协议矩阵', (e as Error).message));
   }
@@ -485,6 +542,7 @@ async function ringTtsOffline(results: RingResult[]): Promise<void> {
       active: 'local',
       volcano: { appId: '', accessToken: '', voice: 'zh_female_roumei' },
       local: { baseUrl: 'http://127.0.0.1:1/tts', voice: 'default' },
+      custom: { baseUrl: '', model: 'tts-1', voice: 'default', apiKey: '' },
     });
 
     const handlers: Record<string, (...a: any[]) => any> = (globalThis as any).__MIAOMA_IPC__;
@@ -834,6 +892,7 @@ async function ringTtsVolcanoAuth(results: RingResult[]): Promise<void> {
       active: 'volcano',
       volcano: { appId: '', accessToken: '', voice: 'zh_female_roumei' },
       local: { baseUrl: 'http://127.0.0.1:1/tts', voice: 'default' },
+      custom: { baseUrl: '', model: 'tts-1', voice: 'default', apiKey: '' },
     });
     let unconfiguredMsg = '';
     try {
@@ -850,6 +909,7 @@ async function ringTtsVolcanoAuth(results: RingResult[]): Promise<void> {
       active: 'volcano',
       volcano: { appId: 'fake-app', accessToken: 'fake-token', voice: 'zh_female_roumei' },
       local: { baseUrl: 'http://127.0.0.1:1/tts', voice: 'default' },
+      custom: { baseUrl: '', model: 'tts-1', voice: 'default', apiKey: '' },
     });
     (globalThis as any).WebSocket = FakeWsError;
     let codeMsg = '';
@@ -1107,19 +1167,19 @@ async function ringAgentPipeline(results: RingResult[]): Promise<void> {
 async function ringLlmConfig(results: RingResult[]): Promise<void> {
   const original = loadLlmConfig();
   try {
-    saveLlmConfig({ active: 'ark', ark: { apiKey: '', model: 'm', baseUrl: 'http://x' }, ollama: { ...original.ollama } });
+    saveLlmConfig({ active: 'ark', ark: { apiKey: '', model: 'm', baseUrl: 'http://x' }, ollama: { ...original.ollama }, custom: { ...original.custom } });
     const afterSave = loadLlmConfig();
     if (afterSave.active !== 'ark') throw new Error('配置未落盘');
     if (isLlmConfigured(afterSave)) throw new Error('空 apiKey 竟被判为已配置');
     const deps1 = createAgentDeps();
     if (deps1.llm.providerId !== 'offline') throw new Error(`未配置时应回退离线，实际 ${deps1.llm.providerId}`);
 
-    saveLlmConfig({ active: 'ark', ark: { apiKey: 'sk-test', model: 'm', baseUrl: 'http://x' }, ollama: { ...original.ollama } });
+    saveLlmConfig({ active: 'ark', ark: { apiKey: 'sk-test', model: 'm', baseUrl: 'http://x' }, ollama: { ...original.ollama }, custom: { ...original.custom } });
     const deps2 = createAgentDeps();
     if (deps2.llm.providerId !== 'ark') throw new Error(`已配置时应使用 ark，实际 ${deps2.llm.providerId}`);
 
     // M1：本地 Ollama 分支（选了且填了地址即生效，不依赖服务真实在线）
-    saveLlmConfig({ active: 'ollama', ark: { ...original.ark }, ollama: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen2.5:7b' } });
+    saveLlmConfig({ active: 'ollama', ark: { ...original.ark }, ollama: { baseUrl: 'http://127.0.0.1:11434', model: 'qwen2.5:7b' }, custom: { ...original.custom } });
     const deps3 = createAgentDeps();
     if (deps3.llm.providerId !== 'ollama') throw new Error(`选 ollama 应使用本地模型 Provider，实际 ${deps3.llm.providerId}`);
     if (typeof (deps3.llm as { bindTools?: unknown }).bindTools !== 'function') {
@@ -1138,6 +1198,469 @@ async function ringLlmConfig(results: RingResult[]): Promise<void> {
     results.push(fail('阶段二·LLM 配置落盘与回退', (e as Error).message));
   } finally {
     saveLlmConfig(original);
+  }
+}
+
+/**
+ * 自定义模型提供者：LLM custom（DeepSeek 型 OpenAI 兼容）路由到 providerId='custom'；
+ * TTS custom 经 mock /audio/speech 真实合成落盘；
+ * VideoGen 任务协议 mock 验证 openai-video 与 seedance 两种形态（建任→轮询→下载）。
+ */
+async function ringCustomProviders(results: RingResult[]): Promise<void> {
+  const name = '自定义模型提供者（LLM/TTS/视频）';
+  const originalLlm = loadLlmConfig();
+  const originalTts = loadTtsConfig();
+  const originalVg = loadVideoGenConfig();
+  let server: import('node:http').Server | null = null;
+  /** 最后一次 seedance 建任载荷：用于断言 duration 已夹到模型接受的档位 */
+  let lastTaskBody = '';
+  /** 最后一次 MiniMax H3 建任载荷：用于断言分辨率档位透传 */
+  let lastMmBody = '';
+  try {
+    const { createServer } = await import('node:http');
+    const wavBytes = Buffer.from('RIFF....WAVEfake-audio-payload-for-bench', 'binary');
+    const mp4Bytes = Buffer.from('ftypmp42fake-video-payload-for-bench', 'binary');
+    server = createServer((req, res) => {
+      const url = req.url ?? '';
+      const json = (obj: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.method === 'POST' && url === '/audio/speech') {
+        res.writeHead(200, { 'content-type': 'audio/mpeg' });
+        res.end(wavBytes);
+      } else if (req.method === 'GET' && url === '/models') {
+        // 方舟风格的模型列表：只应按“看起来是视频模型”筛出 seedance
+        json({
+          data: [
+            { id: 'doubao-seedance-2-5-260628' },
+            { id: 'doubao-seed-1-6-250615' },
+            { id: 'deepseek-v3' },
+          ],
+        });
+      } else if (req.method === 'POST' && url === '/videos') {
+        json({ id: 'vid-1' });
+      } else if (req.method === 'GET' && url === '/videos/vid-1') {
+        json({ id: 'vid-1', status: 'completed', video_url: 'http://127.0.0.1:' + (server!.address() as { port: number }).port + '/file.mp4' });
+      } else if (req.method === 'POST' && url === '/contents/generations/tasks') {
+        let raw = '';
+        req.on('data', (chunk) => (raw += chunk));
+        req.on('end', () => {
+          lastTaskBody = raw;
+          if (raw.includes('m-notopen')) {
+            res.writeHead(404, { 'content-type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: {
+                  code: 'ModelNotOpen',
+                  message: 'Your account 1 has not activated the model m-notopen. Please activate the model service in the Ark Console.',
+                },
+              }),
+            );
+            return;
+          }
+          json({ id: 'sd-1' });
+        });
+      } else if (req.method === 'GET' && url === '/contents/generations/tasks/sd-1') {
+        json({ id: 'sd-1', status: 'succeeded', content: { video_url: 'http://127.0.0.1:' + (server!.address() as { port: number }).port + '/file.mp4' } });
+      } else if (req.method === 'POST' && url === '/v2/video_generation') {
+        // MiniMax H3 建任响应（顶层 task_id）
+        let raw = '';
+        req.on('data', (chunk) => (raw += chunk));
+        req.on('end', () => {
+          lastMmBody = raw;
+          json({ task_id: 'mm-1' });
+        });
+      } else if (req.method === 'GET' && url === '/v2/query/video_generation/mm-1') {
+        // 真实结构：状态与产物包在 task 对象里，成功产物在 task.content.url
+        json({
+          task: {
+            id: 'mm-1',
+            model: 'MiniMax-H3',
+            status: 'succeeded',
+            created_at: 1789977256,
+            updated_at: 1789977400,
+            content: { url: 'http://127.0.0.1:' + (server!.address() as { port: number }).port + '/file.mp4' },
+            resolution: '2K',
+            duration: 4,
+            usage: {},
+            ratio: '16:9',
+            task_type: 'generation',
+          },
+        });
+      } else if (req.method === 'GET' && url === '/file.mp4') {
+        res.writeHead(200, { 'content-type': 'video/mp4' });
+        res.end(mp4Bytes);
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
+    const base = 'http://127.0.0.1:' + (server.address() as { port: number }).port;
+
+    // 1) LLM custom 路由
+    saveLlmConfig({
+      active: 'custom',
+      ark: { ...originalLlm.ark },
+      ollama: { ...originalLlm.ollama },
+      custom: { baseUrl: `${base}/v1`, apiKey: 'sk-bench', model: 'deepseek-chat' },
+    });
+    const llm = createAgentDeps().llm;
+    if (llm.providerId !== 'custom') throw new Error(`LLM 应路由 custom，实际 ${llm.providerId}`);
+    if (typeof llm.bindTools !== 'function') throw new Error('custom LLM 应为 OpenAI 兼容 ChatModel（支持 bindTools）');
+
+    // 2) TTS custom 真实 HTTP 链路
+    saveTtsConfig({
+      active: 'custom',
+      volcano: { ...originalTts.volcano },
+      local: { ...originalTts.local },
+      custom: { baseUrl: base, model: 'tts-1', voice: 'bench', apiKey: '' },
+    });
+    const ttsRes = await synthesizeSpeech({ text: '自定义提供商合成文本', provider: 'custom' });
+    if (ttsRes.provider !== 'custom' || !fs.existsSync(ttsRes.audioPath)) {
+      throw new Error(`TTS custom 合成异常：provider=${ttsRes.provider}`);
+    }
+
+    // 3) VideoGen 两种任务协议形态
+    const workDir = path.join(BASE, 'custom-video');
+    for (const variant of ['openai-video', 'seedance'] as const) {
+      const provider = new HttpTaskVideoProvider({
+        apiKey: 'k-bench',
+        baseUrl: base,
+        model: 'm-bench',
+        variant,
+        workDir,
+        pollIntervalMs: 30,
+        pollTimeoutMs: 5_000,
+      });
+      if (!provider.isConfigured()) throw new Error(`${variant} isConfigured 应为 true`);
+      const gen = await provider.generate({ prompt: '一只猫在沙滩奔跑', durationSec: 4 });
+      if (!fs.existsSync(gen.videoPath) || gen.ext !== 'mp4') {
+        throw new Error(`${variant} 生成产物异常：${gen.videoPath}`);
+      }
+    }
+    // 未填模型 id 时 isConfigured=false（不猜测默认值，避免静默错请求）
+    if (new HttpTaskVideoProvider({ apiKey: 'k', baseUrl: base, model: '', variant: 'seedance', workDir }).isConfigured()) {
+      throw new Error('seedance 未填模型时不应判为可用');
+    }
+    // 4) seedance 短镜头时长必须夹到模型接受档位（2s → 3），否则方舟直接拒接
+    await new HttpTaskVideoProvider({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'm-bench',
+      variant: 'seedance',
+      workDir,
+      pollIntervalMs: 30,
+      pollTimeoutMs: 5_000,
+    }).generate({ prompt: '一只猫', durationSec: 2 });
+    if (!/"duration":3/.test(lastTaskBody)) {
+      throw new Error(`seedance duration 应夹到 3s 档位，实际载荷：${lastTaskBody.slice(0, 200)}`);
+    }
+
+    // 5) 模型未开通：给出中文可行动提示 + configError 标记（供节点中断流水线）
+    const notOpen = new HttpTaskVideoProvider({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'm-notopen',
+      variant: 'seedance',
+      workDir,
+      pollIntervalMs: 30,
+      pollTimeoutMs: 500,
+    });
+    let genErr: (Error & { configError?: boolean }) | null = null;
+    try {
+      await notOpen.generate({ prompt: '一只猫', durationSec: 5 });
+    } catch (e) {
+      genErr = e as Error & { configError?: boolean };
+    }
+    if (!genErr) throw new Error('模型未开通时应报错而不是静默成功');
+    if (!/未开通/.test(genErr.message)) throw new Error(`未开通应给中文提示，实际：${genErr.message}`);
+    if (!genErr.configError) throw new Error('配置类错误应带 configError 标记');
+
+    // 6) gen-clips 全失败必须抛错：不能“流水线全绿 + 0 素材”静默降级
+    const clipState = {
+      requirement: '一只猫',
+      completedNodes: [],
+      scannedAssets: [],
+      storyboard: {
+        title: 't',
+        scenes: [{ order: 0, title: '开场', description: '猫在吃猫粮', durationMs: 2200, expectedKind: 'video' }],
+      },
+      matchResult: { sceneAssets: {} },
+    } as unknown as AgentState;
+    const clipDeps = { videoGen: notOpen, logger: () => {} } as unknown as AgentDeps;
+    let nodeErr = '';
+    try {
+      await NODE_RUNNERS['generate-clips'](clipState, clipDeps);
+    } catch (e) {
+      nodeErr = (e as Error).message;
+    }
+    if (!/全部失败/.test(nodeErr)) {
+      throw new Error(`gen-clips 全失败应中断并报“全部失败”，实际：${nodeErr || '未报错（静默产出 0 素材）'}`);
+    }
+
+    // 7) 拉取可用模型：只留视频类 id（方舟 id 手填几乎必错，设置页靠它选）
+    const remoteModels = await listRemoteModelIds({ baseUrl: base, apiKey: 'k' });
+    if (remoteModels.join(',') !== 'doubao-seedance-2-5-260628') {
+      throw new Error(`模型列表应只含视频模型，实际：${remoteModels.join('|')}`);
+    }
+
+    // 8) MiniMax 国内/海外 Key 不通用：鉴权失败要能映射到另一个区域重试（真实 401 成因）
+    if (minimaxAlternateBase('https://api.minimax.io') !== 'https://api.minimaxi.com') {
+      throw new Error('海外接入点应映射到国内接入点');
+    }
+    if (minimaxAlternateBase('https://api.minimaxi.com/') !== 'https://api.minimax.io') {
+      throw new Error('国内接入点应映射到海外接入点');
+    }
+    if (minimaxAlternateBase('https://example.com') !== null) {
+      throw new Error('未知域名不应做区域切换');
+    }
+    const authErr = toVideoGenError(401, 'authorized_error', 'invalid api key (2049)');
+    if (!authErr.configError || !/minimaxi\.com/.test(authErr.message)) {
+      throw new Error(`401 应标为配置错并提示区域不通用，实际：${authErr.message}`);
+    }
+
+    // 9) MiniMax H3 v2：建任→轮询→下载全链路（回归：状态包在 task 里，按顶层 json.status 读会永远 undefined 空转到超时）
+    const mm = new MiniMaxH3VideoProvider({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'minimax-h3',
+      workDir,
+      pollIntervalMs: 30,
+      pollTimeoutMs: 5_000,
+    });
+    const mmGen = await mm.generate({ prompt: '一只猫在吃猫粮', durationSec: 4, ratio: '16:9' });
+    if (!fs.existsSync(mmGen.videoPath) || mmGen.width <= mmGen.height) {
+      throw new Error(`MiniMax H3 产物异常：${mmGen.videoPath} ${mmGen.width}x${mmGen.height}`);
+    }
+    // 缺省保持 2K（不擅自降级）
+    if (!/"resolution":"2K"/.test(lastMmBody)) {
+      throw new Error(`MiniMax 缺省应发 2K，实际载荷：${lastMmBody.slice(0, 200)}`);
+    }
+    // 设置中心选 768P 时必须透传（单价 0.50 vs 0.80 元/秒，选错就是白花线）
+    await new MiniMaxH3VideoProvider({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'minimax-h3',
+      resolution: '768P',
+      workDir,
+      pollIntervalMs: 30,
+      pollTimeoutMs: 5_000,
+    }).generate({ prompt: '一只猫在吃猫粮', durationSec: 4 });
+    if (!/"resolution":"768P"/.test(lastMmBody)) {
+      throw new Error(`768P 未透传，实际载荷：${lastMmBody.slice(0, 200)}`);
+    }
+    // 10) 参考图必须按 reference_image 角色写进 content（跨段锁主体的传输层）
+    await new MiniMaxH3VideoProvider({
+      apiKey: 'k',
+      baseUrl: base,
+      model: 'minimax-h3',
+      workDir,
+      pollIntervalMs: 30,
+      pollTimeoutMs: 5_000,
+    }).generate({ prompt: '一只猫', durationSec: 4, referenceImage: 'data:image/jpeg;base64,QUJD' });
+    if (!/reference_image/.test(lastMmBody) || !/data:image\/jpeg;base64,QUJD/.test(lastMmBody)) {
+      throw new Error(`参考图未以 reference_image 角色下发，载荷：${lastMmBody.slice(0, 260)}`);
+    }
+
+    // 11) 跳段主体一致性：每段 prompt 同一锚点前缀 + 第二段起携带 base64 参考图
+    //（回归用户实测的“三只不一样的猫”：逐段独立抽卡没有主体约束）
+    const gen: Array<{ prompt: string; referenceImage?: string }> = [];
+    const fakeVideo = path.join(workDir, 'fake-clip.mp4');
+    fs.writeFileSync(fakeVideo, mp4Bytes);
+    const framePath = path.join(workDir, 'frame.jpg');
+    fs.writeFileSync(framePath, Buffer.from('fake-jpeg-bytes-for-data-uri', 'binary'));
+    const recording = {
+      id: 'rec',
+      label: 'rec',
+      isConfigured: () => true,
+      generate: async (req: { prompt: string; referenceImage?: string }) => {
+        gen.push({ prompt: req.prompt, referenceImage: req.referenceImage });
+        return { videoPath: fakeVideo, durationMs: 4000, width: 1920, height: 1080, ext: 'mp4' };
+      },
+    };
+    const anchorState = {
+      requirement: '布偶猫吃猫粮',
+      completedNodes: [],
+      scannedAssets: [],
+      brief: { theme: '一只蓝眼睛布偶猫在安静室内吃猫粮', tone: '温柔治愈', style: ['写实', '暖光'] },
+      storyboard: {
+        title: 't',
+        scenes: [
+          { order: 0, title: '开场', description: '侧前方中近景，猫低头吃粮', durationMs: 4000 },
+          { order: 1, title: '特写', description: '镜头推近面部', durationMs: 4000 },
+        ],
+      },
+      matchResult: { sceneAssets: {} },
+    } as unknown as AgentState;
+    await NODE_RUNNERS['generate-clips'](
+      anchorState,
+      {
+        videoGen: recording,
+        probe: async () => ({ durationMs: 4460, width: 2560, height: 1440, fps: 24, hasAudio: true }),
+        extractFrame: async () => framePath,
+        workDir,
+        logger: () => {},
+      } as unknown as AgentDeps,
+    );
+    if (gen.length !== 2) throw new Error(`应生成两段，实际 ${gen.length}`);
+    if (!/同一个主体/.test(gen[0]!.prompt) || !/侧前方中近景/.test(gen[0]!.prompt)) {
+      throw new Error(`prompt 应含主体锚点+场景描述，实际：${gen[0]!.prompt.slice(0, 160)}`);
+    }
+    if (gen[0]!.referenceImage) throw new Error('第一段不应带参考图（无产物可抽帧）');
+    if (!gen[1]!.referenceImage?.startsWith('data:image/jpeg;base64,')) {
+      throw new Error(`第二段应携带 base64 参考图锁主体，实际：${String(gen[1]!.referenceImage).slice(0, 40)}`);
+    }
+    if (gen[1]!.prompt.slice(0, 80) !== gen[0]!.prompt.slice(0, 80)) {
+      throw new Error('两段 prompt 的锚点前缀必须逐字一致');
+    }
+
+    results.push(
+      ok(
+        name,
+        'LLM→custom；TTS /audio/speech 合成落盘；openai-video 与 seedance 任务链路跑通；MiniMax H3 task 嵌套轮询 + 768P/2K 透传 + reference_image 下发；主体锚点与跨段参考图锁主体；duration 档位/未开通中文报错/gen-clips 不静默/模型列表拉取/MiniMax 区域映射',
+      ),
+    );
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  } finally {
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
+    saveLlmConfig(originalLlm);
+    saveTtsConfig(originalTts);
+    saveVideoGenConfig(originalVg);
+  }
+}
+
+/**
+ * AI 助手对话式剪辑（R2）：ref 解析、计划翻译、非法输入兜底。
+ *
+ * 不依赖真实大模型：这几个都是纯函数，而「模型幻觉出快照里不存在的 ref」
+ * 正是最需要防的那条路径——必须跳过并给人话回执，而不是默默改错片段。
+ */
+function ringAssistantPlan(results: RingResult[]): void {
+  const name = 'R2·对话式剪辑计划与 ref 解析';
+  try {
+    const clip = (id: string, label: string, start: number, duration: number): TimelineClip => ({
+      id,
+      name: label,
+      kind: 'audio',
+      start,
+      duration,
+      offset: 0,
+      hue: 10,
+      assetPath: `C:/media/${label}`,
+    });
+    const tracks: TimelineTrack[] = [
+      { id: 't-audio', kind: 'audio', name: '音乐轨', clips: [clip('c1', 'tts-a.wav', 0, 2000), clip('c2', 'tts-b.wav', 2000, 3000)] },
+      { id: 't-text', kind: 'text', name: '字幕轨', clips: [] },
+    ];
+    const selection = { trackId: 't-audio', clipId: 'c2' };
+
+    // 快照编号按时间序：模型看到的 #N 就是用户在时间线上看到的顺序
+    const snapshot = buildTimelineSnapshot(tracks, selection);
+    if (snapshot.tracks[0]?.clips[0]?.ref !== '音乐轨#1') {
+      throw new Error(`ref 编号异常：${snapshot.tracks[0]?.clips[0]?.ref}`);
+    }
+    if (snapshot.selectedRef !== '音乐轨#2') throw new Error(`selectedRef 异常：${snapshot.selectedRef}`);
+
+    // 四种写法 + 越界引用
+    if (resolveClipRef('音乐轨 第 1 段', tracks, selection)?.clipId !== 'c1') throw new Error('中文序号 ref 解析失败');
+    if (resolveClipRef('选中', tracks, selection)?.clipId !== 'c2') throw new Error('「选中」解析失败');
+    if (resolveClipRef('#2', tracks, selection)?.clipId !== 'c2') throw new Error('全局序号解析失败');
+    if (resolveClipRef('tts-a.wav', tracks, selection)?.clipId !== 'c1') throw new Error('按片段名解析失败');
+    if (resolveClipRef('音乐轨#9', tracks, selection) !== null) throw new Error('越界序号应返回 null');
+
+    const plan = parseEditPlan({
+      reply: '将删除音乐轨第 1 段并把第 2 段静音',
+      actions: [
+        { type: 'removeClip', ref: '音乐轨#1' },
+        { type: 'updateClip', ref: '选中', patch: { muted: true, volume: 0.6 } },
+        { type: 'addCaption', text: '好吃', startMs: 1000, durationMs: 2000 },
+        { type: 'seekTo', startMs: 1500 },
+        { type: 'removeClip', ref: '不存在的轨#7' },
+      ],
+    });
+    const translated = translatePlan(plan, tracks, selection);
+    if (translated.actions.length !== 3) throw new Error(`应产出 3 个动作，实际 ${translated.actions.length}`);
+    if (translated.seekMs !== 1500) throw new Error(`seekTo 未单独提取：${translated.seekMs}`);
+    if (!translated.notes.some((n) => /没找到片段/.test(n))) throw new Error('无法解析的 ref 应给人话提示');
+    if (translated.lines.length !== 4) throw new Error(`确认卡片应列 4 行，实际 ${translated.lines.length}`);
+    const update = translated.actions.find((a) => a.type === 'updateClip');
+    if (!update || update.type !== 'updateClip' || update.patch.muted !== true || update.patch.volume !== 0.6) {
+      throw new Error('updateClip 字段映射异常');
+    }
+
+    // 非法输入必须抛错（错误文本回灌给模型重试），不能悄悄产出半个动作
+    let threw = '';
+    try {
+      parseEditPlan({ reply: '', actions: [] });
+    } catch (e) {
+      threw = (e as Error).message;
+    }
+    if (!/reply 不能为空/.test(threw)) throw new Error(`空 reply 应被拒，实际：${threw || '未抛错'}`);
+
+    threw = '';
+    try {
+      parseEditPlan({ reply: 'x', actions: [{ type: 'removeClip' }] });
+    } catch (e) {
+      threw = (e as Error).message;
+    }
+    if (!/缺少 ref/.test(threw)) throw new Error(`缺 ref 应被拒，实际：${threw || '未抛错'}`);
+
+    results.push(ok(name, '快照按时间编号 / 四种 ref 写法解析 / 动作与摘要同源 / 幻觉 ref 逐条跳过 / 非法计划抛错重试'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  }
+}
+
+/**
+ * 编辑器属性真实接线：面板字段（scale/rotation/opacity/volume/muted）经 bridge 回写工程，
+ * 渲染链消费（scale/rotate/colorchannelmixer/volume），往返不漂移；静音片段不接入混音。
+ */
+function ringClipPropertiesWire(results: RingResult[]): void {
+  const name = '编辑器属性回写→渲染消费';
+  try {
+    const proj = createEmptyProject({ name: 'props', canvas: { width: 320, height: 240, fps: 25 } });
+    const assetId = createId();
+    proj.assets = [
+      { id: assetId, name: 'p.mp4', path: FIX1, addedAt: nowIso(), type: 'video', duration: 3000, width: 1920, height: 1080, hasAudio: true, tags: [] },
+    ];
+    const mkTracks = (muted: boolean) => [
+      {
+        id: createId(), kind: 'video' as const, name: '视频 1',
+        clips: [
+          {
+            id: createId(), name: 'A', kind: 'video' as const, start: 0, duration: 1500, offset: 0, hue: 0, assetPath: FIX1,
+            scale: 1.5, rotation: 90, opacity: 0.5, volume: 0.8, muted,
+          },
+        ],
+      },
+    ];
+    const built = timelineToProject(proj, mkTracks(false));
+    const cv = built.tracks[0]!.clips[0] as VideoClip;
+    if (cv.transform.scale !== 1.5 || cv.transform.rotation !== 90 || cv.transform.opacity !== 0.5) {
+      throw new Error(`transform 回写异常：${JSON.stringify(cv.transform)}`);
+    }
+    if (cv.volume !== 0.8 || cv.muted !== false) throw new Error(`音量回写异常：volume=${cv.volume} muted=${cv.muted}`);
+    // 往返：工程 → 时间线读回一致（面板受控数据源正确）
+    const back = projectToTimeline(built)[0]!.clips[0]!;
+    if (back.scale !== 1.5 || back.rotation !== 90 || back.opacity !== 0.5 || back.volume !== 0.8) {
+      throw new Error(`往返读取异常：${JSON.stringify({ s: back.scale, r: back.rotation, o: back.opacity, v: back.volume })}`);
+    }
+    // 渲染链消费断言
+    const opts = { drawtextAvailable: false, subtitlesAvailable: false, videoEncoder: 'libx264', audioEncoder: 'aac', pixelFormat: 'yuv420p' };
+    const plan = buildRenderPlan(built, path.join(BASE, 'props-out.mp4'), opts);
+    for (const frag of ['scale=w=iw*1.5', 'rotate=angle=', 'colorchannelmixer=aa=0.5', 'volume=0.8']) {
+      if (!plan.filterComplex.includes(frag)) throw new Error(`filter_complex 缺少「${frag}」`);
+    }
+    // 静音：带音轨素材的 muted 片段不应接入任何 [i:a] 混音输入
+    const mutedBuilt = timelineToProject(proj, mkTracks(true));
+    const mutedPlan = buildRenderPlan(mutedBuilt, path.join(BASE, 'props-muted.mp4'), opts);
+    if (/\[\d+:a\]/.test(mutedPlan.filterComplex)) throw new Error('静音片段仍接入了音频流');
+    results.push(ok(name, 'scale/rotate/opacity/volume 进 filter_complex；往返一致；静音断开混音'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
   }
 }
 
@@ -1347,6 +1870,7 @@ async function ringVoiceCloneM3(results: RingResult[]): Promise<void> {
       active: 'volcano',
       volcano: { ...originalTts.volcano, appId: '', accessToken: '' },
       local: { baseUrl: `http://127.0.0.1:${port}`, voice: 'default' },
+      custom: { ...originalTts.custom },
     });
 
     const first = await synthesizeSpeech({ text: '零样本第一条旁白', voiceId: profile.id });
@@ -1653,6 +2177,15 @@ export async function runSmoke(): Promise<RingResult[]> {
 
   // M5：工程版本管理与回滚
   await ringVersioningM5(results);
+
+  // 编辑器属性回写→渲染消费
+  ringClipPropertiesWire(results);
+
+  // 自定义模型提供者（LLM/TTS/视频）
+  await ringCustomProviders(results);
+
+  // R2 对话式剪辑：计划解析与 ref 落地
+  ringAssistantPlan(results);
 
   return results;
 }

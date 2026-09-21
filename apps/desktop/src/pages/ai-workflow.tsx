@@ -3,6 +3,7 @@ import { Check, CircleAlert, FolderPlus, Loader2, Scissors, Sparkles, Square, X 
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/input';
 import type { PipelineNode } from '@miaoma/agent';
+import { getActiveProject } from '@/lib/active-project';
 import {
   cancelAgent,
   getAgentSession,
@@ -40,10 +41,30 @@ const NODE_ORDER: PipelineNode[] = [
   'save-project',
 ];
 
+/**
+ * 当前工程里真实素材所在的目录。
+ *
+ * 重跑同一个工程时直接带出这些目录，match-assets 就能命中已有画面，
+ * 不会给同样的镜头再烧一轮 AI 视频生成（按秒计费）。
+ */
+function projectAssetDirs(): string[] {
+  const dirs = new Set<string>();
+  for (const asset of getActiveProject().assets) {
+    const p = asset.path ?? '';
+    // mock:// 占位与 http(s):// 远端地址不是本地目录，跳过
+    if (!p || /:\/\//.test(p)) continue;
+    const dir = p.replace(/[\\/][^\\/]*$/, '');
+    if (dir && dir !== p) dirs.add(dir);
+  }
+  return [...dirs];
+}
+
 export default function AiWorkflowPage() {
   const [session, setSession] = useState(getAgentSession());
   const [requirement, setRequirement] = useState(session.requirement);
   const [dirs, setDirs] = useState<string[]>(session.sourceDirs);
+  /** 视频生成模型已配置：没挂目录时要给出计费警示，而不是轻描淡写地“可留空” */
+  const [videoGenReady, setVideoGenReady] = useState(false);
 
   useEffect(() => {
     const un = subscribeAgentSession(setSession);
@@ -54,14 +75,20 @@ export default function AiWorkflowPage() {
 
   useEffect(() => initAgentEvents(), []);
 
-  // 预填素材库已扫描目录
+  // 预填素材库已扫描目录 + 当前工程素材所在目录，并查一次视频模型配置状态
   useEffect(() => {
     void (async () => {
       const api = window.electronAPI;
-      if (!api) return;
+      const inferred = projectAssetDirs();
+      if (!api) {
+        if (inferred.length) setDirs((prev) => [...new Set([...prev, ...inferred])]);
+        return;
+      }
       try {
-        const d = await api.library.dirs();
-        if (d && d.length > 0) setDirs((prev) => (prev.length ? prev : d));
+        const [d, vg] = await Promise.all([api.library.dirs(), api.videoGen.status().catch(() => null)]);
+        if (vg && vg.active !== 'offline' && vg.configured) setVideoGenReady(true);
+        const merged = [...new Set([...(d ?? []), ...inferred])];
+        if (merged.length) setDirs((prev) => (prev.length ? prev : merged));
       } catch {
         /* 忽略：素材库不可用时让用户自行选择 */
       }
@@ -80,7 +107,11 @@ export default function AiWorkflowPage() {
     const api = window.electronAPI;
     if (!api) return;
     const picked = await api.library.pickDir();
-    if (picked?.length) setDirs((prev) => [...new Set([...prev, ...picked])]);
+    if (!picked?.length) return;
+    const merged = [...new Set([...dirs, ...picked])];
+    setDirs(merged);
+    // 顺手登记进素材库（directories 会落盘）：否则下次启动 AI 页又得重选一遍
+    void api.library.scan(merged).catch(() => undefined);
   }
 
   async function handleStart() {
@@ -135,7 +166,7 @@ export default function AiWorkflowPage() {
               disabled={busy}
               onChange={(e) => setRequirement(e.target.value)}
               placeholder="例如：做一个 30 秒的夏日旅行 vlog，节奏轻快，竖屏"
-              className="min-h-16"
+              className="min-h-24 resize-y"
             />
 
             <div className="mt-3">
@@ -146,8 +177,10 @@ export default function AiWorkflowPage() {
                 </Button>
               </div>
               {dirs.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  未选择目录（可留空，引擎会走纯旁白分镜）
+                <p className={cn('text-xs', videoGenReady ? 'text-amber-400' : 'text-muted-foreground')}>
+                  {videoGenReady
+                    ? '未选择目录：所有场景都会走 AI 视频生成（按秒计费，6 场景约 12–19 元）。挂上本地素材目录后，命中的场景不再调模型。'
+                    : '未选择目录（可留空，引擎会走纯旁白分镜；当前未配置视频生成模型，不会产生生成费用）'}
                 </p>
               ) : (
                 <ul className="space-y-1">

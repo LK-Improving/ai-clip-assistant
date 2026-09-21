@@ -139,6 +139,12 @@ export interface AgentDeps {
   videoGen?: VideoGenProvider;
   /** 探测素材元数据；生产环境注入 desktop 的 probeMedia，离线环境注入启发式实现 */
   probe: (filePath: string) => Promise<MediaProbe>;
+  /**
+   * 从视频产物抽一帧存图并返回本地图片路径（可选）。
+   * 桌面端注入 ffmpeg 实现，供 generate-clips 做跳段“参考图锁主体”；
+   * 缺省时自动退化为仅靠文本锚点维持一致性。
+   */
+  extractFrame?: (videoPath: string, atMs: number) => Promise<string | null>;
   /** TTS 音频落盘目录 */
   workDir: string;
   /** 进度/调试日志 */

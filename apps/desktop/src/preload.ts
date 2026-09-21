@@ -10,6 +10,7 @@ import type { TtsConfig } from './main/services/tts/config';
 import type { TtsRequest, TtsResult } from './main/services/tts';
 import type { Project } from '@miaoma/video-project';
 import type { PipelineNode, StoryboardScene } from '@miaoma/agent';
+import type { AssistantTimelineSnapshot, EditPlan } from '@miaoma/agent';
 import type { AgentSnapshot } from './main/services/agent';
 import type { LlmConfig } from './main/services/llm/config';
 import type { VideoGenConfig } from './main/services/video-gen/config';
@@ -81,9 +82,9 @@ const api = {
     /** 解释某个本地路径为何无法被预览加载（不存在 / 未授权） */
     diagnose: (filePath: string): Promise<{ ok: boolean; reason: string }> =>
       ipcRenderer.invoke('media:diagnose', filePath),
-    /** 确保素材可被 <video> 播放：编码不被支持时返回转码后的 H.264 代理路径 */
-    playable: (filePath: string): Promise<PlayableResult> =>
-      ipcRenderer.invoke('media:playable', filePath),
+    /** 确保素材可被 <video> 播放：编码不支持时转码 H.264 代理；force=true 跳过编码白名单强制出 faststart 代理 */
+    playable: (filePath: string, force?: boolean): Promise<PlayableResult> =>
+      ipcRenderer.invoke('media:playable', filePath, force),
   },
 
   project: {
@@ -175,12 +176,26 @@ const api = {
     },
   },
 
+  /**
+   * AI 助手：自然语言 → 时间线改动计划。
+   * 主进程只出计划，ref 解析、用户确认与执行都在渲染进程的时间线 store 里做。
+   */
+  assistant: {
+    plan: (input: { message: string; snapshot: AssistantTimelineSnapshot }): Promise<EditPlan> =>
+      ipcRenderer.invoke('assistant:plan', input),
+  },
+
   videoGen: {
     getConfig: (): Promise<VideoGenConfig> => ipcRenderer.invoke('videoGen:get-config'),
     setConfig: (config: VideoGenConfig): Promise<VideoGenConfig> =>
       ipcRenderer.invoke('videoGen:set-config', config),
     status: (): Promise<{ active: VideoGenConfig['active']; configured: boolean }> =>
       ipcRenderer.invoke('videoGen:status'),
+    /** 拉取接入点可用的视频模型 id；不传则用已保存配置 */
+    listModels: (
+      opts?: { apiKey?: string; baseUrl?: string },
+    ): Promise<{ ok: boolean; models: string[]; error?: string }> =>
+      ipcRenderer.invoke('videoGen:list-models', opts),
   },
 
   /** M3 自定义音色库（零样本克隆）：导入带校验，删除连带样本清理 */

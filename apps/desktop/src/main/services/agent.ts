@@ -4,6 +4,7 @@ import { dirname, extname } from 'node:path';
 import path from 'node:path';
 import {
   createLlmProvider,
+  HttpTaskVideoProvider,
   INTERRUPT_NODE,
   MiniMaxH3VideoProvider,
   OfflineTtsProvider,
@@ -29,6 +30,7 @@ import { addAllowedPath } from '../protocol';
 import { probeMedia } from './probe';
 import { getProjectStore } from './project-store';
 import { synthesizeSpeech, ttsStatus, zeroShotFallbackReason } from './tts';
+import { generateThumbnail } from './thumbnail';
 import { loadLlmConfig } from './llm/config';
 import { loadVideoGenConfig } from './video-gen/config';
 
@@ -92,6 +94,21 @@ async function probeAdapter(filePath: string): Promise<MediaProbe> {
   return { durationMs: r.durationMs, width: r.width, height: r.height, fps: r.fps, hasAudio: r.hasAudio };
 }
 
+/**
+ * 抽帧适配器：复用缩略图服务（带缓存）为 generate-clips 提供跳段“参考图锁主体”。
+ *
+ * 宽度取 1280：MiniMax 参考图要求宽高在 [256,5760]px 且长宽比在 [0.4,2.5]，
+ * 默认 320px 缩略图虽合法但细节太少，锁不住主体花纹；失败返回 null，
+ * 节点会退化为仅靠文本锚点维持一致性（不阻断成片）。
+ */
+async function extractFrameAdapter(videoPath: string, atMs: number): Promise<string | null> {
+  try {
+    return await generateThumbnail(videoPath, { atMs, width: 1280 });
+  } catch {
+    return null;
+  }
+}
+
 function workDir(): string {
   const dir = path.join(app.getPath('userData'), 'agent-tts');
   mkdirSync(dir, { recursive: true });
@@ -127,8 +144,20 @@ function clearRunCheckpoint(): void {
  * 选了 ark 但没填密钥时回退离线 Provider —— 与 TTS 同一策略，
  * 保证「没配好也想先跑通链路」，而不是直接把整条流水线打挂。
  */
-function resolveLlm(logger?: (msg: string) => void): AgentChatModel {
+/** 导出给 AI 助手规划器复用：同一套设置中心配置与离线回退策略，不另起一条 LLM 路径 */
+export function resolveLlm(logger?: (msg: string) => void): AgentChatModel {
   const cfg = loadLlmConfig();
+  if (cfg.active === 'custom') {
+    // 自定义 OpenAI 兼容端点（DeepSeek 等）：填了 key+地址才启用，否则回退离线
+    const provider = createLlmProvider({
+      type: 'custom',
+      apiKey: cfg.custom.apiKey || process.env.CUSTOM_LLM_API_KEY || '',
+      baseUrl: cfg.custom.baseUrl || process.env.CUSTOM_LLM_BASE_URL,
+      model: cfg.custom.model || process.env.CUSTOM_LLM_MODEL,
+    });
+    if (provider.isConfigured()) return provider;
+    logger?.('[agent] 已选择自定义 LLM 但未填 apiKey/baseUrl，本次回退离线 Provider');
+  }
   if (cfg.active === 'ollama') {
     // 本地 Ollama（M1 三模型引擎）：服务可达性无法静态判断，连接失败由
     // invokeStructured 的重试/降级兜底接住，不会打挂流水线
@@ -157,8 +186,10 @@ export function createAgentDeps(logger?: (msg: string) => void): AgentDeps {
   return {
     llm: resolveLlm(logger),
     tts: new DesktopTtsAdapter(logger),
-    videoGen: resolveVideoGen(logger),
+    videoGen: lazyVideoGen(logger),
     probe: probeAdapter,
+    // 跳段锁主体：从上一段 AI 产物抽一帧，作为下一段生成的参考图
+    extractFrame: extractFrameAdapter,
     workDir: workDir(),
     logger,
     // M2：LLM token 级流式→带序号广播 type='token'，渲染层据此打关键区域打字机效果
@@ -168,27 +199,93 @@ export function createAgentDeps(logger?: (msg: string) => void): AgentDeps {
 
 /**
  * 解析视频生成 Provider：优先用「设置中心 → AI 设置 → 视频生成模型」的配置。
- * 选了 MiniMax H3 但没填密钥时回退离线 Provider —— 与 LLM/TTS 同一策略，
+ * 选了任一在线 Provider 但没填密钥时回退离线 —— 与 LLM/TTS 同一策略，
  * 保证「没配好也想先跑通链路」，而不是直接把整条流水线打挂。
+ * 支持：MiniMax H3 / Seedance（方舟视频）/ 自定义 OpenAI 兼容任务协议。
  */
 function resolveVideoGen(logger?: (msg: string) => void): VideoGenProvider {
   const cfg = loadVideoGenConfig();
+  const videoDir = () => {
+    const dir = path.join(app.getPath('userData'), 'agent-video');
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
   if (cfg.active === 'minimax') {
     const apiKey = cfg.minimax.apiKey || process.env.MINIMAX_API_KEY || '';
     if (apiKey) {
-      const dir = path.join(app.getPath('userData'), 'agent-video');
-      mkdirSync(dir, { recursive: true });
       return new MiniMaxH3VideoProvider({
         apiKey,
         baseUrl: cfg.minimax.baseUrl || undefined,
         model: cfg.minimax.model || 'minimax-h3',
-        workDir: dir,
+        // 分辨率档位由设置中心控制（2K 0.80 元/秒 / 768P 0.50 元/秒），缺省保持 2K
+        resolution: cfg.minimax.resolution === '768P' ? '768P' : '2K',
+        workDir: videoDir(),
         logger,
       });
     }
     logger?.('[agent] 已选择 MiniMax H3 但未填写 apiKey，本次不生成 AI 视频');
   }
+  if (cfg.active === 'seedance') {
+    const apiKey = cfg.seedance.apiKey || process.env.ARK_VIDEO_API_KEY || '';
+    if (apiKey && cfg.seedance.model) {
+      return new HttpTaskVideoProvider({
+        apiKey,
+        baseUrl: cfg.seedance.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3',
+        model: cfg.seedance.model,
+        variant: 'seedance',
+        workDir: videoDir(),
+        logger,
+      });
+    }
+    logger?.('[agent] 已选择 Seedance 但未填 apiKey/模型 id（以方舟控制台为准），本次不生成 AI 视频');
+  }
+  if (cfg.active === 'custom') {
+    if (cfg.custom.apiKey && cfg.custom.baseUrl && cfg.custom.model) {
+      return new HttpTaskVideoProvider({
+        apiKey: cfg.custom.apiKey,
+        baseUrl: cfg.custom.baseUrl,
+        model: cfg.custom.model,
+        variant: 'openai-video',
+        workDir: videoDir(),
+        logger,
+      });
+    }
+    logger?.('[agent] 自定义视频模型需 apiKey/baseUrl/model 三项齐全，本次不生成 AI 视频');
+  }
   return new OfflineVideoGenProvider();
+}
+
+/** 按配置指纹缓存 Provider，只在配置真变了时重建并记一行日志 */
+let videoGenCache: { key: string; provider: VideoGenProvider } | null = null;
+
+function resolveVideoGenCached(logger?: (msg: string) => void): VideoGenProvider {
+  const key = JSON.stringify(loadVideoGenConfig());
+  if (videoGenCache && videoGenCache.key === key) return videoGenCache.provider;
+  const provider = resolveVideoGen(logger);
+  videoGenCache = { key, provider };
+  logger?.(`[agent] 视频生成 Provider：${provider.label}`);
+  return provider;
+}
+
+/**
+ * 懒解析视频 Provider。
+ *
+ * 流水线 deps 在 start 时就固定了，而引擎会停在分镜审批等人确认：
+ * 用户在这期间去设置中心改好视频模型（开通/换 id），如果还拿旧 Provider，
+ * 后半段依旧报“未配置”，必须重启重跑。这层包装把选择推延到每次调用，
+ * 配置一改下一次生成即生效。
+ */
+function lazyVideoGen(logger?: (msg: string) => void): VideoGenProvider {
+  return {
+    get id() {
+      return resolveVideoGenCached(logger).id;
+    },
+    get label() {
+      return resolveVideoGenCached(logger).label;
+    },
+    isConfigured: () => resolveVideoGenCached(logger).isConfigured(),
+    generate: (req) => resolveVideoGenCached(logger).generate(req),
+  };
 }
 
 /** ===== 运行时会话 ===== */

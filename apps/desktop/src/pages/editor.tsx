@@ -1,49 +1,52 @@
 import { Download, Import, Scissors, Sparkles } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AssetPanel, type LibraryAsset } from '@/components/editor/asset-panel';
 import { Preview } from '@/components/editor/preview';
 import { PropertyPanel } from '@/components/editor/property-panel';
 import { Timeline, type AssetDropPayload } from '@/components/editor/timeline';
 import { useLibrary } from '@/hooks/use-library';
 import {
-  createId,
+  useApplyTimeline,
+  useTimelineAssetHints,
+  useTimelineSaveState,
+  useTimelineSelection,
+  useTimelineTracks,
+} from '@/hooks/use-timeline';
+import { nextFreeStart, onSeekRequest } from '@/lib/timeline-store';
+import {
   formatTimecode,
-  totalDuration,
+  timelineTotalMs,
   type TimelineClip,
   type TimelineTrack,
 } from '@/lib/timeline-utils';
-import { getActiveProject, saveActiveProject, syncActiveProject } from '@/lib/active-project';
-import { projectToTimeline, timelineToProject, type AssetMetaHint } from '@/lib/project-bridge';
+import { getActiveProject } from '@/lib/active-project';
+import type { AssetMetaHint } from '@/lib/project-bridge';
 import { cn } from '@/lib/utils';
-
-/** 空工程的默认轨道：视频 / 音频 / 字幕各一条 */
-function defaultTracks(): TimelineTrack[] {
-  return [
-    { id: createId('track'), kind: 'video', name: '视频 1', clips: [] },
-    { id: createId('track'), kind: 'audio', name: '音频 1', clips: [] },
-    { id: createId('track'), kind: 'text', name: '字幕', clips: [] },
-  ];
-}
 
 /** 07 视频编辑器：五区布局 + 真实素材 + 时间线交互（模块 3.1 / 3.2 / 3.3） */
 export default function EditorPage() {
   const library = useLibrary();
-  // 从激活工程恢复时间线；空工程则给出默认轨道
-  const [tracks, setTracks] = useState<TimelineTrack[]>(() => {
-    const restored = projectToTimeline(getActiveProject());
-    return restored.length > 0 ? restored : defaultTracks();
-  });
-  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const firstRender = useRef(true);
+  // 时间线状态与防抖落盘都在 lib/timeline-store（AI 助手面板共用同一份），
+  // 页面只留播放态；所有改动经 applyActions 走统一 action 通道
+  const tracks = useTimelineTracks();
+  const applyActions = useApplyTimeline();
+  const [selected, setSelected] = useTimelineSelection();
+  const saveState = useTimelineSaveState();
   const [currentMs, setCurrentMs] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [selected, setSelected] = useState<{ trackId: string; clipId: string } | null>(null);
 
   const [ttsText, setTtsText] = useState('');
   const [ttsBusy, setTtsBusy] = useState(false);
   const [ttsMessage, setTtsMessage] = useState<string | null>(null);
 
-  const totalMs = useMemo(() => Math.max(totalDuration(tracks), 30_000), [tracks]);
+  // 与时间线底部「总时长」同一个口径（之前这里硬兜底 30s，导致预览区比实际作品长一截）
+  const totalMs = useMemo(() => timelineTotalMs(tracks), [tracks]);
+
+  // 外部（AI 助手）发起的播放头跳转：currentMs 是高频值不进 store，走事件通道
+  useEffect(
+    () => onSeekRequest((ms) => setCurrentMs(Math.min(Math.max(0, ms), totalMs))),
+    [totalMs],
+  );
 
   // 播放循环：以播放头为准，预览区视频跟随
   useEffect(() => {
@@ -100,24 +103,9 @@ export default function EditorPage() {
     return map;
   }, [assets]);
 
-  /** 时间线改动 → 回写工程 → 防抖落盘（首次渲染只做恢复，不触发保存） */
-  useEffect(() => {
-    if (firstRender.current) {
-      firstRender.current = false;
-      return;
-    }
-    const timer = setTimeout(async () => {
-      setSaveState('saving');
-      try {
-        syncActiveProject(timelineToProject(getActiveProject(), tracks, assetHints));
-        const saved = await saveActiveProject();
-        setSaveState(saved ? 'saved' : 'idle');
-      } catch {
-        setSaveState('error');
-      }
-    }, 800);
-    return () => clearTimeout(timer);
-  }, [tracks, assetHints]);
+  /** 把素材元数据交给 store：落盘由 store 统一做，避免“只有编辑器页挂着时改动才会被保存” */
+  const hintsProvider = useCallback(() => assetHints, [assetHints]);
+  useTimelineAssetHints(hintsProvider);
 
   const selectedClip: TimelineClip | null = useMemo(() => {
     if (!selected) return null;
@@ -136,13 +124,29 @@ export default function EditorPage() {
     return (inRange.find((item) => item.track.kind === 'video') ?? inRange[0])?.clip ?? null;
   }, [tracks, currentMs]);
 
-  const appendClip = useCallback((trackId: string, clip: Omit<TimelineClip, 'id'>) => {
-    setTracks((prev) =>
-      prev.map((track) =>
-        track.id === trackId ? { ...track, clips: [...track.clips, { ...clip, id: createId('clip') }] } : track,
-      ),
-    );
-  }, []);
+  /**
+   * 命中播放头的音频轨片段（旁白/音乐）：预览要一起混音。
+   * 之前预览区只有一个 〈video〉，只出当前视频片段原声，
+   * 时间线里音乐轨再满也听不到东西。
+   */
+  const activeAudioClips = useMemo(
+    () =>
+      tracks
+        .filter((track) => track.kind === 'audio')
+        .flatMap((track) => track.clips)
+        .filter(
+          (clip) =>
+            clip.assetPath && currentMs >= clip.start && currentMs < clip.start + clip.duration,
+        ),
+    [tracks, currentMs],
+  );
+
+  const addClipToTrack = useCallback(
+    (trackId: string, clip: Omit<TimelineClip, 'id'>) => {
+      applyActions([{ type: 'addClip', trackId, clip }]);
+    },
+    [applyActions],
+  );
 
   const handleAddAsset = useCallback(
     (asset: LibraryAsset) => {
@@ -150,74 +154,64 @@ export default function EditorPage() {
         asset.kind === 'audio' ? 'audio' : asset.kind === 'subtitle' ? 'text' : 'video';
       const track = tracks.find((t) => t.kind === targetKind) ?? tracks[0];
       if (!track) return;
-      const start = track.clips.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
-      appendClip(track.id, {
+      addClipToTrack(track.id, {
         name: asset.name,
         kind: targetKind,
-        start: start === 0 ? 0 : start + 200,
+        start: nextFreeStart(track),
         duration: asset.durationMs || 5000,
         offset: 0,
         hue: (asset.name.charCodeAt(0) * 7) % 360,
         assetPath: asset.path.startsWith('mock://') ? undefined : asset.path,
       });
     },
-    [tracks, appendClip],
+    [tracks, addClipToTrack],
   );
 
   const handleDropAsset = useCallback(
     (trackId: string, payload: AssetDropPayload) => {
       const track = tracks.find((t) => t.id === trackId);
       if (!track) return;
-      const start = track.clips.reduce((max, clip) => Math.max(max, clip.start + clip.duration), 0);
-      appendClip(trackId, {
+      addClipToTrack(trackId, {
         name: payload.name,
         kind: track.kind,
-        start: start === 0 ? 0 : start + 200,
+        start: nextFreeStart(track),
         duration: payload.durationMs || 5000,
         offset: 0,
         hue: payload.hue,
         assetPath: payload.path?.startsWith('mock://') ? undefined : payload.path,
       });
     },
-    [tracks, appendClip],
+    [tracks, addClipToTrack],
   );
 
   const handleClipChange = useCallback(
     (trackId: string, clipId: string, patch: Partial<TimelineClip>) => {
-      setTracks((prev) =>
-        prev.map((track) =>
-          track.id === trackId
-            ? {
-                ...track,
-                clips: track.clips.map((clip) => (clip.id === clipId ? { ...clip, ...patch } : clip)),
-              }
-            : track,
-        ),
-      );
+      applyActions([{ type: 'updateClip', trackId, clipId, patch }]);
     },
-    [],
+    [applyActions],
   );
 
-  const handleDeleteClip = useCallback((trackId: string, clipId: string) => {
-    setTracks((prev) =>
-      prev.map((track) =>
-        track.id === trackId ? { ...track, clips: track.clips.filter((clip) => clip.id !== clipId) } : track,
-      ),
-    );
-    setSelected(null);
-  }, []);
+  const handleDeleteClip = useCallback(
+    (trackId: string, clipId: string) => {
+      applyActions([{ type: 'removeClip', trackId, clipId }]);
+      setSelected(null);
+    },
+    [applyActions, setSelected],
+  );
 
-  const handleAddTrack = useCallback((kind: TimelineTrack['kind']) => {
-    setTracks((prev) => {
-      const index = prev.filter((t) => t.kind === kind).length + 1;
-      const label = kind === 'video' ? '视频' : kind === 'audio' ? '音频' : '字幕';
-      return [...prev, { id: createId('track'), kind, name: `${label} ${index}`, clips: [] }];
-    });
-  }, []);
+  const handleAddTrack = useCallback(
+    (kind: TimelineTrack['kind']) => {
+      applyActions([{ type: 'addTrack', kind }]);
+    },
+    [applyActions],
+  );
 
-  const handleRemoveTrack = useCallback((trackId: string) => {
-    setTracks((prev) => prev.filter((track) => track.id !== trackId));
-  }, []);
+  const handleRemoveTrack = useCallback(
+    (trackId: string) => {
+      applyActions([{ type: 'removeTrack', trackId }]);
+    },
+    [applyActions],
+  );
 
   // Delete 键删除选中片段
   useEffect(() => {
@@ -245,11 +239,10 @@ export default function EditorPage() {
       const result = await api.tts.synthesize({ text: ttsText });
       const audioTrack = tracks.find((t) => t.kind === 'audio');
       if (audioTrack) {
-        const start = audioTrack.clips.reduce((max, c) => Math.max(max, c.start + c.duration), 0);
-        appendClip(audioTrack.id, {
+        addClipToTrack(audioTrack.id, {
           name: `配音_${ttsText.slice(0, 8)}`,
           kind: 'audio',
-          start: start === 0 ? 0 : start + 200,
+          start: nextFreeStart(audioTrack),
           duration: result.durationMs || 3000,
           offset: 0,
           hue: 265,
@@ -264,7 +257,7 @@ export default function EditorPage() {
     } finally {
       setTtsBusy(false);
     }
-  }, [ttsText, tracks, appendClip]);
+  }, [ttsText, tracks, addClipToTrack]);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -328,6 +321,7 @@ export default function EditorPage() {
           totalMs={totalMs}
           playing={playing}
           activeClip={activeClip}
+          audioClips={activeAudioClips}
           onTogglePlay={() => setPlaying((p) => !p)}
           onSeek={(ms) => setCurrentMs(Math.min(ms, totalMs))}
         />

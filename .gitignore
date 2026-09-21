@@ -12,3 +12,6 @@ Thumbs.db
 coverage/
 .eslintcache
 *.tsbuildinfo
+# AI 生成的证据/素材视频与临时验证目录（体积大，不入库）
+demo-assets/
+_tmp_probe/

@@ -2,13 +2,14 @@ import { LruCache, ttsCacheKey, ttsCachePath } from './cache';
 import type { TtsConfig } from './config';
 import { loadTtsConfig } from './config';
 import { localProvider, zeroShotSynthesize } from './providers/local';
+import { customProvider } from './providers/custom';
 import { volcanoProvider } from './providers/volcano';
 import { probeMedia } from '../probe';
 import { getVoice } from '../voice';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 export interface TtsProvider {
-  id: 'volcano' | 'local';
+  id: 'volcano' | 'local' | 'custom';
   label: string;
   /** 配置是否齐全（缺密钥时前端给出明确提示，而不是静默失败） */
   isConfigured(config: TtsConfig): boolean;
@@ -21,6 +22,7 @@ export interface TtsProvider {
 const providers: Record<TtsProvider['id'], TtsProvider> = {
   volcano: volcanoProvider,
   local: localProvider,
+  custom: customProvider,
 };
 
 /** 内存 LRU：最近 64 条合成结果直接命中，不走网络 */
@@ -127,13 +129,15 @@ export async function synthesizeSpeech(request: TtsRequest): Promise<TtsResult> 
 
   const providerId = request.provider ?? config.active;
   const provider = providers[providerId];
-  const voice = request.voice ?? (providerId === 'volcano' ? config.volcano.voice : config.local.voice);
+  const voice = request.voice ?? (providerId === 'volcano' ? config.volcano.voice : providerId === 'custom' ? config.custom.voice : config.local.voice);
 
   if (!provider.isConfigured(config)) {
     throw new Error(
       providerId === 'volcano'
         ? '尚未配置火山引擎 TTS（appId / accessToken），请在设置中心填写，或切换到本地 Index-TTS 2'
-        : '本地 Index-TTS 2 未配置服务地址，请在设置中心填写 baseUrl',
+        : providerId === 'custom'
+          ? '自定义 TTS 未配置服务地址（OpenAI 兼容 baseUrl），请在设置中心填写'
+          : '本地 Index-TTS 2 未配置服务地址，请在设置中心填写 baseUrl',
     );
   }
 
@@ -179,6 +183,7 @@ export function ttsStatus() {
     configured: {
       volcano: providers.volcano.isConfigured(config),
       local: providers.local.isConfigured(config),
+      custom: providers.custom.isConfigured(config),
     },
   };
 }

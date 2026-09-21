@@ -18,6 +18,7 @@ export * from './llm';
 export * from './structured';
 export * from './semantic';
 export * from './video-gen';
+export * from './assistant';
 export * from './deps';
 export { AgentStateAnnotation, toAgentState } from './graph-state';
 export type { GraphStateType } from './graph-state';

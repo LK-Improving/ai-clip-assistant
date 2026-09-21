@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -350,13 +350,51 @@ function matchType(assetType: Asset['type'], want: SceneAssetType): boolean {
 /** ===== 节点 4.5：AI 视频生成（补全无素材场景） ===== */
 
 /**
+ * 跨场景主体锚点（纯文本层一致性）。
+ *
+ * 逐段独立文生视频最大的坑是每段各抽一次卡、主体外观漂移（实测会“三只不一样的猫”）。
+ * 把 brief 的主题/调性/风格压成固定前缀拼在每场 prompt 开头，并显式要求
+ * 「同一主体、同一场景、同一光线」，是不依赖参考图、任何 Provider 都生效的最低成本手段。
+ */
+function subjectAnchor(state: AgentState): string {
+  const b = state.brief;
+  const parts = [
+    b?.theme,
+    b?.tone ? `整体调性：${b.tone}` : '',
+    b?.style?.length ? `视觉风格：${b.style.slice(0, 6).join('、')}` : '',
+  ].filter(Boolean);
+  const identity =
+    '全片所有镜头必须是同一个主体（外观、花色、体型、材质、颜色、五官完全一致），处于同一个场景、同一套光线与色调，摄影质感统一';
+  return [...parts, identity].filter(Boolean).join('；');
+}
+
+/**
+ * 本地图片 → data URI（MiniMax content.image_url 支持 `data:image/<格式>;base64,`，格式小写）。
+ *
+ * 请求体总上限 64MB，参考图超 4MB 直接放弃（宁可退化为纯文本锚点，也不要把请求理掉）。
+ */
+function toImageDataUri(imagePath: string): string | null {
+  try {
+    const buf = readFileSync(imagePath);
+    if (buf.length === 0 || buf.length > 4 * 1024 * 1024) return null;
+    const ext = path.extname(imagePath).replace(/^\./, '').toLowerCase();
+    const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+    return `data:${mime};base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 为「分镜里没有匹配到真实素材」的场景生成 AI 视频片段（MiniMax H3 等）。
  *
  * - 仅在视频生成 Provider 已配置（isConfigured）时工作；离线/未配置则直接跳过，
  *   保证无网络/无密钥时整条链路仍端到端跑通（与 TTS 降级策略一致）。
  * - 生成结果作为 video Asset 追加到 state.scannedAssets，并把 matchResult 指回去，
  *   后续 speech-synthesis / assemble-timeline 无需感知「这段是 AI 生成的」——统一走普通视频素材逻辑。
- * - 单段失败只记日志跳过，不中断整条流水线（抽卡失败不应拖垮成片）。
+ * - 单段失败只记日志跳过，不中断整条流水线（抽卡失败不应拖垮成片）；
+ *   全部失败或遇配置/超时类错误则中断（见下）。
+ * - 一致性：每段 prompt 都拼上主体锚点前缀，并从第一段产物抽帧作为后续段的参考图（锁主体）。
  */
 export async function generateClips(state: AgentState, deps: AgentDeps): Promise<NodeUpdate> {
   const vg = deps.videoGen;
@@ -374,28 +412,52 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
     canvas && canvas.height > canvas.width ? '9:16' : canvas && canvas.width === canvas.height ? '1:1' : '16:9';
 
   let generated = 0;
+  let attempted = 0;
+  let firstFailure: (Error & { configError?: boolean; stopOnFailure?: boolean }) | null = null;
+  const anchor = subjectAnchor(state);
+  /** 锁主体参考图：固定用第一段成功产物的一帧（逐段更新会累积漂移） */
+  let referenceImage: string | null = null;
   for (const scene of storyboard.scenes) {
     const existing = sceneAssets[scene.order];
     if (existing) continue; // 已有真实素材，不必 AI 生成
 
-    const prompt = (scene.description || scene.title || scene.narration || state.requirement).trim().slice(0, 800);
+    const sceneText = (scene.description || scene.title || scene.narration || state.requirement).trim();
+    // 锚点在前：超长被截时先丢场景细节，不会丢掉主体约束（MiniMax 文本上限 2000 字符）
+    const prompt = [anchor, sceneText].filter(Boolean).join('。').slice(0, 1600);
     if (!prompt) continue;
 
+    attempted += 1;
     try {
       const res = await vg.generate({
         prompt,
         durationSec: scene.durationMs / 1000,
         ratio,
+        referenceImage: referenceImage ?? undefined,
       });
+      // 产物真实分辨率/时长以文件为准：Provider 只能按请求档位估算
+      //（实测 MiniMax H3 请 16:9 + 2K 实际回 2560x1440、请 4s 实际 4.46s）
+      let width = res.width ?? 1920;
+      let height = res.height ?? 1080;
+      let durationMs = Math.max(1, res.durationMs);
+      try {
+        const probed = await deps.probe(res.videoPath);
+        if (probed.width && probed.height) {
+          width = probed.width;
+          height = probed.height;
+        }
+        if (probed.durationMs > 0) durationMs = probed.durationMs;
+      } catch {
+        // 探测失败沿用 Provider 估算值，不阻断成片
+      }
       const asset: Asset = {
         id: createId(),
         name: `AI生成-${scene.order + 1}.${res.ext}`,
         path: res.videoPath,
         addedAt: nowIso(),
         type: 'video',
-        duration: Math.max(1, res.durationMs),
-        width: res.width ?? 1920,
-        height: res.height ?? 1080,
+        duration: durationMs,
+        width,
+        height,
         hasAudio: true,
         tags: ['ai-generated'],
         // 语义预处理：把场景画面描述写进素材，二次编辑时检索/匹配可命中
@@ -406,9 +468,35 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
       addedAssets.push(asset);
       generated += 1;
       deps.logger?.(`[gen-clips] 场景 ${scene.order} 生成视频：${res.videoPath}`);
+      // 第一段成功后抽一帧作为后续场景的参考图（跨段锁主体）；
+      // 未注入抽帧能力、或图过大时静默退化为纯文本锚点一致性
+      if (!referenceImage && deps.extractFrame) {
+        try {
+          const frame = await deps.extractFrame(res.videoPath, Math.min(1500, Math.max(0, durationMs - 500)));
+          const uri = frame ? toImageDataUri(frame) : null;
+          if (uri) {
+            referenceImage = uri;
+            deps.logger?.('[gen-clips] 已取第 1 段产物帧作为后续场景的主体参考图（跨段锁主体）');
+          }
+        } catch (e) {
+          deps.logger?.(`[gen-clips] 抽参考帧失败，后续段仅靠文本锚点维持一致：${(e as Error).message}`);
+        }
+      }
     } catch (e) {
-      deps.logger?.(`[gen-clips] 场景 ${scene.order} 生成失败，跳过：${(e as Error).message}`);
+      const err = e as Error & { configError?: boolean; stopOnFailure?: boolean };
+      firstFailure ??= err;
+      deps.logger?.(`[gen-clips] 场景 ${scene.order} 生成失败，跳过：${err.message}`);
+      // 配置类错误（模型未开通 / id 不存在 / Key 无效）每个场景都会一模一样地失败，
+      // 轮询超时则说明服务整体不可用；两种情况下继续建任只会多等 N 倍时长、多刷 N 笔计费，直接停下
+      if (err.configError || err.stopOnFailure) break;
     }
+  }
+
+  // 一段都没出：不能“全绿 + 0 素材”静默降级，否则用户不知道为何没视频
+  if (attempted > 0 && generated === 0) {
+    throw new Error(
+      `AI 视频生成全部失败（已尝试 ${attempted} 个场景）：${firstFailure?.message ?? '未知原因'}`,
+    );
   }
 
   deps.logger?.(`[gen-clips] 共生成 ${generated} 段 AI 视频`);

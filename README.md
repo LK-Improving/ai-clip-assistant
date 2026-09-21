@@ -7,9 +7,9 @@
 | 层 | 技术 | 说明 |
 | --- | --- | --- |
 | 桌面壳 | Electron 44 + Electron Forge 7 | 主进程 / 预加载 / 渲染进程三层隔离 |
-| 前端 | React 19 + Vite 7 + TailwindCSS 4 + shadcn/ui | 经典五区剪辑布局 |
+| 前端 | React 19 + Vite 7 + TailwindCSS 4 + shadcn/ui | 经典五区剪辑布局；属性面板变换/音量/转场全量真实接线（bridge 回写工程→filter_complex 消费，往返不漂移） |
 | 数据模型 | `@miaoma/video-project`（Zod 4） | 判别联合 + `schemaVersion` 迁移；Asset 含语义描述与 96 维特征向量（P2，optional 向后兼容） |
-| 智能体 | `@miaoma/agent`（**LangGraph.js** `@langchain/langgraph` StateGraph 编排，LLM 经 **LangChain.js** `@langchain/core` 模型抽象，另接 `@langchain/openai` / `@langchain/ollama`） | 10 节点流水线 + 原生 interrupt 人机中断 + Checkpoint 断点续传；match-assets 语义贪心匹配；**三模型引擎（火山方舟/本地 Ollama/离线，设置中心可切，M1）**（Function Calling + Zod + 自动重试）+ 离线/火山/本地 TTS（baseUrl 适配，未内置模型权重/声音克隆） |
+| 智能体 | `@miaoma/agent`（**LangGraph.js** `@langchain/langgraph` StateGraph 编排，LLM 经 **LangChain.js** `@langchain/core` 模型抽象，另接 `@langchain/openai` / `@langchain/ollama`） | 10 节点流水线 + 原生 interrupt 人机中断 + Checkpoint 断点续传；match-assets 语义贪心匹配；**多模型引擎（火山方舟 / 本地 Ollama / 离线 / 自定义 OpenAI 兼容如 DeepSeek，设置中心可切）**（Function Calling + Zod + 自动重试）+ 离线/火山/本地/自定义 TTS 四路由（未内置模型权重）；视频生成 Seedance/MiniMax/自定义任务协议可选 |
 | 渲染 | FFmpeg（阶段四已完成 + P1 效果消费） | 时间线 JSON → `filter_complex` → MP4；消费片段 `effects`（fade-in/fade-out 转场、eq/blackwhite/blur 滤镜白名单，未知效果降级告警）；失败/取消自动回滚半成品产物 |
 
 ## 目录结构
@@ -70,5 +70,7 @@ pnpm bench:metrics # M6：性能与效果实测基线（TTS 缓存/增量扫描/
 - [x] 阶段二续 M5：工程版本管理 + 云端协同——isomorphic-git 实现：`project-store.save` 挂 fire-and-forget 快照钩子（内部全捕获，绝不阻断保存）；`userData/project-repo` 本地 git 仓，一工程一文件天然可 diff；`project:history/read-version/diff-versions/restore-version` + `version:remote-*/push/pull` IPC 链路；回滚作为新版本线性落盘（历史不重写）；仓库损坏（垃圾 .git）自愈重建；可选 GitHub/Gitee 远端 https+token 手动 push/pull（token 仅存本机，离线历史完整）；项目页版本面板（列表/双版对比/回滚/远端配置）；`pnpm smoke` 共 **33 环全绿**（真实 push/pull 待远端凭证，属 C 类联调）
 
 - [x] 阶段二续 M6：量化实测基线——`scripts/bench/metrics.*`（esbuild 打包真实主进程服务，Node 端可复跑）五组指标实测：增量重扫 20 文件 20ms vs 全量 21.4s（≈1068x）、TTS 命中 1ms vs 未命中 1.5s、200 坏样本经 Zod+重试+兜底后崩溃 0（对照裸 parse 崩 80/200）、checkpoint 崩溃恢复 275ms、110 片段工程存 21ms/读 40ms；报告 `docs/性能与效果实测.md`
+
+- [x] 自定义模型提供者（P-自定义）：三类模型均可接任意 OpenAI 兼容端点——LLM 加 `custom`（DeepSeek 等，ChatOpenAI 兼容 baseURL，支持 bindTools）；TTS 加 `custom`（POST {base}/audio/speech）；视频生成加 `seedance`（方舟任务协议）与 `custom`（OpenAI /videos 任务协议），统一 `HttpTaskVideoProvider` 建任→轮询→下载，未填模型 id 不猜测默认值；设置中心三区块均新增选项与字段；新冒烟环 mock 验证全链路，`pnpm smoke` 共 **35 环全绿**
 
 MVP 顺序：1.1 → 1.2 → 1.3 → 2.1/2.2（控制台跑通 AI）→ 3.1/4.1（FFmpeg 渲染验证）→ 3.2/4.2（界面串联）→ TTS 与细节优化。

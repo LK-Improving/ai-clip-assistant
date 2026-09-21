@@ -148,7 +148,7 @@ export default function StoryboardPage() {
                 value={current.narration}
                 onChange={(e) => updateScene(current.order, { narration: e.target.value })}
                 placeholder="留空则该场不生成旁白与字幕"
-                className="min-h-24"
+                className="min-h-24 resize-y"
               />
             </div>
 
@@ -214,7 +214,8 @@ export default function StoryboardPage() {
               <Textarea
                 value={current.description}
                 onChange={(e) => updateScene(current.order, { description: e.target.value })}
-                className="min-h-16"
+                placeholder="该场画面描述（会拼上主体锚点作为 AI 视频生成的提示词）"
+                className="min-h-24 resize-y"
               />
             </div>
           </div>

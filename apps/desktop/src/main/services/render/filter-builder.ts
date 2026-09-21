@@ -22,6 +22,12 @@ export interface RenderCapabilities {
   pixelFormat: string;
   drawtext: boolean;
   subtitles: boolean;
+  /**
+   * 该 ffmpeg 实际列出的 H.264 系编码器（按优先级排序）。
+   * 预览代理只认 H.264（Chromium 可解码），首选编码器在真实素材上失败时可依次回退，
+   * 因此与 videoEncoder 分开暴露。老缓存/老调用方可不填。
+   */
+  videoEncoderCandidates?: string[];
 }
 
 export interface BuildOptions {
@@ -293,8 +299,10 @@ export function buildRenderPlan(
     )},setpts=PTS-STARTPTS`;
     const chain: string[] = [inLabel];
 
-    // 适配画布（contain）
-    chain.push(`scale=w=${W}:h=${H}:force_original_aspect_ratio=decrease`);
+    // 适配画布（contain）：force_divisible_by=2 保证缩放后边长为偶数，
+    // AI 生成素材尺寸五花八门（实测 MiniMax H3 会回 1344x768），竖屏画布 contain 后会得到
+    // 1080x617 这种奇数高，部分滤镜/编码器组合会直接报「not divisible by 2」
+    chain.push(`scale=w=${W}:h=${H}:force_original_aspect_ratio=decrease:force_divisible_by=2`);
     chain.push(`setsar=1`);
 
     // 旋转（仅非零时）

@@ -13,6 +13,7 @@ import ProjectsPage from '@/pages/projects';
 import SettingsPage from '@/pages/settings';
 import StoryboardPage from '@/pages/storyboard';
 import TasksPage from '@/pages/tasks';
+import { bindTimelineToActiveProject } from '@/lib/timeline-store';
 
 /**
  * 极简 hash 路由：#/home、#/editor ...
@@ -45,6 +46,12 @@ export default function App() {
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
+
+  /**
+   * 时间线 store 绑定激活工程：载入当前工程，并在打开/新建工程时重载。
+   * 不绑的话会出现“切了工程但时间线还是上一个”。
+   */
+  useEffect(() => bindTimelineToActiveProject(), []);
 
   const page = routes[route] ?? routes['/home']!;
 

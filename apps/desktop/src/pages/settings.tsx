@@ -71,6 +71,98 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 }
 
 /**
+ * 视频模型 id 输入 + 一键拉取可用模型。
+ *
+ * 方舟视频模型 id 是小写带日期版本（如 doubao-seedance-2-5-260628），手填极易写错，
+ * 错一个字符就是 404，而生成失败在流水线里只体现为“没视频”，所以这里直接把可选列表拉回来选。
+ * 不用 Field包裹：内部有按钮与下拉，放在 label 里会误触发输入框焦点。
+ */
+function VideoModelPicker({
+  label,
+  value,
+  apiKey,
+  baseUrl,
+  onPick,
+}: {
+  label: string;
+  value: string;
+  apiKey: string;
+  baseUrl: string;
+  onPick: (model: string) => void;
+}) {
+  const [models, setModels] = useState<string[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  /** 当前填写的 id 不在拉回来的列表里（方舟常见：写了大写/缺日期后缀） */
+  const notInList = Boolean(models && models.length > 0 && value && !models.includes(value));
+
+  async function fetchModels() {
+    const api = window.electronAPI;
+    if (!api?.videoGen?.listModels) {
+      setError('需在桌面端使用（浏览器预览模式无法拉取）');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.videoGen.listModels({ apiKey, baseUrl });
+      if (res.ok) {
+        // 不自动改写用户已填的 id，只标记“不在列表里”，避免静默换模型
+        setModels(res.models);
+      } else {
+        setModels(null);
+        setError(res.error ?? '拉取失败');
+      }
+    } catch (e) {
+      setModels(null);
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <span className="text-xs font-medium text-muted-foreground">{label}</span>
+      <div className="flex items-center gap-2">
+        <Input
+          className="flex-1"
+          value={value}
+          placeholder="如 doubao-seedance-2-5-260628"
+          onChange={(e) => onPick(e.target.value)}
+        />
+        <Button size="sm" variant="outline" className="shrink-0 rounded-full px-3" onClick={() => void fetchModels()} disabled={busy}>
+          {busy ? '拉取中…' : '拉取可用模型'}
+        </Button>
+      </div>
+      {error ? <p className="text-xs text-destructive">{error}</p> : null}
+      {models && models.length > 0 ? (
+        <>
+          <select
+            className="flex h-9 w-full rounded-md border border-input bg-transparent px-2 text-xs"
+            value={value}
+            onChange={(e) => onPick(e.target.value)}
+          >
+            {models.includes(value) ? null : <option value={value}>{value || '（选择模型）'}</option>}
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+          <p className="text-[11px] text-muted-foreground">
+            共 {models.length} 个视频模型 id；能选到不代表已开通，未开通时生成会直接报错并给出提示。
+          </p>
+          {notInList ? (
+            <p className="text-xs text-destructive">当前填写的 id 不在可用列表里（方舟为小写带日期版本），请从下拉重选</p>
+          ) : null}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * M3 自定义音色库（零样本克隆）：参考音频导入（带校验）/试听/删除。
  * 分镜页每场可选音色；本地 Index-TTS 2 服务不可用时自动降级常规音色（不阻断成片）。
  */
@@ -230,19 +322,27 @@ export default function SettingsPage() {
   const ttsReady = tts
     ? tts.active === 'volcano'
       ? Boolean(tts.volcano.appId && tts.volcano.accessToken)
-      : Boolean(tts.local.baseUrl)
+      : tts.active === 'custom'
+        ? Boolean(tts.custom.baseUrl)
+        : Boolean(tts.local.baseUrl)
     : false;
   const llmReady = llm
     ? llm.active === 'offline'
       ? true
       : llm.active === 'ollama'
         ? Boolean(llm.ollama.baseUrl && llm.ollama.model)
-        : Boolean(llm.ark.apiKey)
+        : llm.active === 'custom'
+          ? Boolean(llm.custom.apiKey && llm.custom.baseUrl && llm.custom.model)
+          : Boolean(llm.ark.apiKey)
     : false;
   const videoGenReady = videoGen
     ? videoGen.active === 'offline'
       ? true
-      : Boolean(videoGen.minimax.apiKey)
+      : videoGen.active === 'seedance'
+        ? Boolean(videoGen.seedance.apiKey && videoGen.seedance.model)
+        : videoGen.active === 'custom'
+          ? Boolean(videoGen.custom.apiKey && videoGen.custom.baseUrl && videoGen.custom.model)
+          : Boolean(videoGen.minimax.apiKey)
     : false;
 
   return (
@@ -291,6 +391,7 @@ export default function SettingsPage() {
                     >
                       <option value="volcano">火山引擎</option>
                       <option value="local">本地 Index-TTS 2</option>
+                      <option value="custom">自定义（OpenAI 兼容 /audio/speech）</option>
                     </select>
                   </Field>
 
@@ -322,7 +423,7 @@ export default function SettingsPage() {
                         />
                       </Field>
                     </>
-                  ) : (
+                  ) : tts.active === 'local' ? (
                     <>
                       <Field label="服务地址">
                         <Input
@@ -338,6 +439,44 @@ export default function SettingsPage() {
                           value={tts.local.voice}
                           onChange={(e) =>
                             setTts({ ...tts, local: { ...tts.local, voice: e.target.value } })
+                          }
+                        />
+                      </Field>
+                    </>
+                  ) : (
+                    <>
+                      <Field label="接入点（OpenAI 兼容根路径）">
+                        <Input
+                          value={tts.custom.baseUrl}
+                          placeholder="如 http://127.0.0.1:5000/v1（POST {base}/audio/speech）"
+                          onChange={(e) =>
+                            setTts({ ...tts, custom: { ...tts.custom, baseUrl: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="模型">
+                        <Input
+                          value={tts.custom.model}
+                          placeholder="tts-1 或服务文档指定"
+                          onChange={(e) =>
+                            setTts({ ...tts, custom: { ...tts.custom, model: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="音色">
+                        <Input
+                          value={tts.custom.voice}
+                          onChange={(e) =>
+                            setTts({ ...tts, custom: { ...tts.custom, voice: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="API Key（可选，网关要求 Bearer 时填）">
+                        <Input
+                          type="password"
+                          value={tts.custom.apiKey ?? ''}
+                          onChange={(e) =>
+                            setTts({ ...tts, custom: { ...tts.custom, apiKey: e.target.value } })
                           }
                         />
                       </Field>
@@ -375,6 +514,7 @@ export default function SettingsPage() {
                       <option value="offline">离线（确定性，无需联网）</option>
                       <option value="ark">火山方舟（豆包）</option>
                       <option value="ollama">本地 Ollama（私有化）</option>
+                      <option value="custom">自定义（OpenAI 兼容，如 DeepSeek）</option>
                     </select>
                   </Field>
 
@@ -392,6 +532,33 @@ export default function SettingsPage() {
                           value={llm.ollama.model}
                           placeholder="qwen2.5:7b"
                           onChange={(e) => setLlm({ ...llm, ollama: { ...llm.ollama, model: e.target.value } })}
+                        />
+                      </Field>
+                    </>
+                  ) : null}
+
+                  {llm.active === 'custom' ? (
+                    <>
+                      <Field label="接入点（OpenAI 兼容根路径）">
+                        <Input
+                          value={llm.custom.baseUrl}
+                          placeholder="https://api.deepseek.com/v1"
+                          onChange={(e) => setLlm({ ...llm, custom: { ...llm.custom, baseUrl: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="API Key">
+                        <Input
+                          type="password"
+                          value={llm.custom.apiKey}
+                          placeholder="留空则回退离线 Provider"
+                          onChange={(e) => setLlm({ ...llm, custom: { ...llm.custom, apiKey: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="模型">
+                        <Input
+                          value={llm.custom.model}
+                          placeholder="以服务商控制台模型 id 为准，如 deepseek-chat"
+                          onChange={(e) => setLlm({ ...llm, custom: { ...llm.custom, model: e.target.value } })}
                         />
                       </Field>
                     </>
@@ -430,7 +597,7 @@ export default function SettingsPage() {
                   ) : llm.active === 'offline' ? (
                     <p className="text-xs text-muted-foreground">
                       离线 Provider 依据需求文本与素材清单确定性生成简报与分镜，适合无网络/无密钥环境；
-                      在设置里切到「火山方舟」并填写 API Key 即可使用真实大模型，或切到「本地 Ollama」接私有化模型。
+                      可切到「火山方舟」「本地 Ollama」或「自定义 OpenAI 兼容（DeepSeek 等）」并填写密钥使用真实大模型。
                     </p>
                   ) : null}
 
@@ -450,7 +617,7 @@ export default function SettingsPage() {
             </Section>
 
             {/* 视频生成模型 */}
-            <Section title="视频生成模型" desc="为没有真实素材的分镜生成 AI 视频片段（MiniMax H3 / Hailuo 3.0）">
+            <Section title="视频生成模型" desc="为没有真实素材的分镜生成 AI 视频片段（Seedance / MiniMax H3 / 自定义）">
               {videoGen ? (
                 <>
                   <Field label="Provider">
@@ -462,9 +629,73 @@ export default function SettingsPage() {
                       }
                     >
                       <option value="offline">离线（不生成视频，仅字幕/标题）</option>
+                      <option value="seedance">Seedance（火山方舟视频，与 LLM 同账号）</option>
                       <option value="minimax">MiniMax H3（海螺 3.0）</option>
+                      <option value="custom">自定义（OpenAI 兼容视频任务）</option>
                     </select>
                   </Field>
+
+                  {videoGen.active === 'seedance' ? (
+                    <>
+                      <Field label="API Key（方舟，可与 LLM 同一 Key）">
+                        <Input
+                          type="password"
+                          value={videoGen.seedance.apiKey}
+                          placeholder="留空则不生成 AI 视频"
+                          onChange={(e) =>
+                            setVideoGen({ ...videoGen, seedance: { ...videoGen.seedance, apiKey: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <VideoModelPicker
+                        label="模型（以方舟控制台视频列表为准）"
+                        value={videoGen.seedance.model}
+                        apiKey={videoGen.seedance.apiKey}
+                        baseUrl={videoGen.seedance.baseUrl}
+                        onPick={(model) =>
+                          setVideoGen({ ...videoGen, seedance: { ...videoGen.seedance, model } })
+                        }
+                      />
+                      <Field label="接入点">
+                        <Input
+                          value={videoGen.seedance.baseUrl}
+                          onChange={(e) =>
+                            setVideoGen({ ...videoGen, seedance: { ...videoGen.seedance, baseUrl: e.target.value } })
+                          }
+                        />
+                      </Field>
+                    </>
+                  ) : null}
+
+                  {videoGen.active === 'custom' ? (
+                    <>
+                      <Field label="接入点（OpenAI 兼容根路径）">
+                        <Input
+                          value={videoGen.custom.baseUrl}
+                          placeholder="POST {base}/videos 建任 + GET {base}/videos/{id} 轮询"
+                          onChange={(e) =>
+                            setVideoGen({ ...videoGen, custom: { ...videoGen.custom, baseUrl: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="API Key">
+                        <Input
+                          type="password"
+                          value={videoGen.custom.apiKey}
+                          onChange={(e) =>
+                            setVideoGen({ ...videoGen, custom: { ...videoGen.custom, apiKey: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <VideoModelPicker
+                        label="模型"
+                        value={videoGen.custom.model}
+                        apiKey={videoGen.custom.apiKey}
+                        baseUrl={videoGen.custom.baseUrl}
+                        onPick={(model) => setVideoGen({ ...videoGen, custom: { ...videoGen.custom, model } })}
+                      />
+                    </>
+                  ) : null}
 
                   {videoGen.active === 'minimax' ? (
                     <>
@@ -504,21 +735,53 @@ export default function SettingsPage() {
                           }
                         />
                       </Field>
+                      <Field label="生成分辨率（按秒计费）">
+                        <select
+                          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                          value={videoGen.minimax.resolution ?? '2K'}
+                          onChange={(e) =>
+                            setVideoGen({
+                              ...videoGen,
+                              minimax: {
+                                ...videoGen.minimax,
+                                resolution: e.target.value as '768P' | '2K',
+                              },
+                            })
+                          }
+                        >
+                          <option value="2K">2K（2560×1440）— 0.80 元/秒，画质最好</option>
+                          <option value="768P">768P — 0.50 元/秒，省 37.5%</option>
+                        </select>
+                      </Field>
                       <p className="text-xs text-muted-foreground">
-                        接入点留空则默认 global（api.minimax.io）；国内网络可改为 https://api.minimaxi.com。
+                        一次 6 场景成片至少生成 24 秒（H3 最短 4s/段）：2K 约 19.2 元、768P 约 12 元。
+                        工程画布只有 1080p 时 2K 产物会被下采样，验证阶段建议选 768P；
+                        挂上素材目录后命中真实素材的场景不会调模型。
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        接入点必须与 Key 同源：国内平台（platform.minimax.cn）注册的 Key 填
+                        https://api.minimaxi.com，海外（minimax.io）填 https://api.minimax.io；
+                        两者不通用（填错只会报 invalid api key，引擎会自动换区重试一次）。
                       </p>
                     </>
                   ) : (
                     <p className="text-xs text-muted-foreground">
                       离线模式下，AI 成片不会调用视频生成模型，缺失素材的场景将退化为纯字幕/标题；
-                      切到「MiniMax H3」并填入 API Key 后，引擎会在分镜阶段自动为缺素材场景补齐 AI 视频。
+                      切到「Seedance / MiniMax H3 / 自定义」并填入 API Key 与模型 id 后，
+                      引擎会在分镜阶段自动为缺素材场景补齐 AI 视频（生成全部失败时会直接报错，不再静默出 0 素材）。
                     </p>
                   )}
 
                   <div className="flex items-center justify-between pt-1">
                     <ConfiguredHint
                       ok={videoGenReady}
-                      text={videoGenReady ? '已配置，将为缺素材场景生成 AI 视频' : '未配置，不生成 AI 视频'}
+                      text={
+                        videoGenReady
+                          ? videoGen.active === 'offline'
+                            ? '离线模式，不生成 AI 视频'
+                            : '已填写；能否真生成取决于该模型在 Provider 后台已开通（可用「拉取可用模型」校验）'
+                          : '未配置完整，不生成 AI 视频'
+                      }
                     />
                     <Button size="sm" className="rounded-full px-4" onClick={saveVideoGen}>
                       保存视频模型
