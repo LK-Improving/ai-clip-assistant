@@ -62,6 +62,13 @@ export interface VideoGenResult {
 export interface VideoGenProvider {
   readonly id: string;
   readonly label: string;
+  /**
+   * 单次可生成的最长秒数（整段一镜到底模式的判据）。
+   *
+   * 实测 MiniMax H3 接受 4–15s，方舟 Seedance 档位为 3/5/10/12；
+   * 不声明（undefined）的 Provider 不参与整段模式，退回逐镜头生成。
+   */
+  readonly maxDurationSec?: number;
   /** 配置是否齐全（缺密钥时上层跳过生成，而非中断整条链路） */
   isConfigured(): boolean;
   /** 生成一段视频并返回本地路径 */
@@ -168,6 +175,8 @@ export interface MiniMaxH3Options {
 export class MiniMaxH3VideoProvider implements VideoGenProvider {
   readonly id = 'minimax-h3';
   readonly label: string;
+  /** 实测服务端：supported durations 4s–15s */
+  readonly maxDurationSec = 15;
   private readonly apiKey: string;
   private baseUrl: string;
   private readonly model: string;
@@ -424,6 +433,8 @@ export interface TaskVideoOptions {
 export class HttpTaskVideoProvider implements VideoGenProvider {
   readonly id: string;
   readonly label: string;
+  /** 方舟 Seedance 只接受 3/5/10/12 四个档位，上限 12s；OpenAI 兼容任务协议按 15s 保守处理 */
+  readonly maxDurationSec: number;
   private readonly opts: TaskVideoOptions;
   private readonly baseUrl: string;
 
@@ -431,6 +442,7 @@ export class HttpTaskVideoProvider implements VideoGenProvider {
     this.opts = opts;
     this.baseUrl = normalizeBase(opts.baseUrl) ?? '';
     this.id = `task-${opts.variant}`;
+    this.maxDurationSec = opts.variant === 'seedance' ? 12 : 15;
     this.label = `${opts.variant === 'seedance' ? 'Seedance（方舟视频）' : '自定义视频'}（${opts.model || '未填模型'}）`;
   }
 

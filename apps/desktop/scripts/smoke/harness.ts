@@ -58,7 +58,7 @@ import {
 import { resolveFfmpegPath } from '../../src/main/ffmpeg';
 import { probeMedia } from '../../src/main/services/probe';
 import { createAgentDeps, resumeAgentRun, retryAgentRun, startAgentRun } from '../../src/main/services/agent';
-import { HttpTaskVideoProvider, MiniMaxH3VideoProvider, NODE_RUNNERS, listRemoteModelIds, minimaxAlternateBase, parseEditPlan, toVideoGenError } from '@miaoma/agent';
+import { HttpTaskVideoProvider, MiniMaxH3VideoProvider, AI_TIMELINE_TAG, NODE_RUNNERS, listRemoteModelIds, minimaxAlternateBase, parseEditPlan, toVideoGenError } from '@miaoma/agent';
 import { buildTimelineSnapshot, resolveClipRef, translatePlan } from '../../src/lib/assistant-apply';
 import { estimatePlanCost } from '../../src/main/services/assistant';
 import { applyTimelineActions, canUndo, getTracks, undoTimeline } from '../../src/lib/timeline-store';
@@ -1725,6 +1725,110 @@ function ringAssistantPlan(results: RingResult[]): void {
 }
 
 /**
+ * 整段一镜到底生成（用户反馈：“每分镜一段容易不连贯，应该整段给模型”）。
+ *
+ * 两个必须一起成立的点：
+ * 1. 待生成镜头总时长在模型单次上限内 → 只建一次任务，所有镜头共用一条素材；
+ * 2. assemble 阶段同一素材的入点按累计时长往后推 → 拼出来是连续画面，
+ *    而不是每个镜头都在重播开头几秒。
+ */
+async function ringWholeShotGeneration(results: RingResult[]): Promise<void> {
+  const name = '整段一镜到底生成与共用素材入点';
+  try {
+    const calls: Array<{ prompt: string; durationSec?: number }> = [];
+    const provider = {
+      id: 'fake',
+      label: 'fake',
+      maxDurationSec: 15,
+      isConfigured: () => true,
+      generate: async (req: { prompt: string; durationSec?: number }) => {
+        calls.push({ prompt: req.prompt, durationSec: req.durationSec });
+        return {
+          videoPath: path.join(BASE, 'whole-shot.mp4'),
+          durationMs: Math.round((req.durationSec ?? 5) * 1000),
+          width: 1280,
+          height: 720,
+          ext: 'mp4',
+        };
+      },
+    };
+    const deps = {
+      videoGen: provider,
+      probe: async () => ({ durationMs: 9000, width: 1280, height: 720, fps: 24, hasAudio: true }),
+      logger: () => {},
+      workDir: BASE,
+    } as unknown as AgentDeps;
+
+    function makeState(sceneMs: number): AgentState {
+      return {
+        requirement: '猫吃猫粮',
+        sourceDirs: [],
+        completedNodes: [],
+        scannedAssets: [],
+        speechSegments: [],
+        brief: {
+          title: '猫的饭',
+          theme: '一只蓝眼睛布偶猫安静吃猫粮',
+          tone: '温柔治愈',
+          targetDurationMs: sceneMs * 3,
+          canvas: { width: 1920, height: 1080, fps: 30 },
+          style: ['写实'],
+          outline: [],
+        },
+        storyboard: {
+          title: '猫的饭',
+          scenes: [0, 1, 2].map((order) => ({
+            order,
+            title: `镜头${order}`,
+            description: `镜头${order}的画面`,
+            narration: '',
+            durationMs: sceneMs,
+            expectedKind: 'video',
+          })),
+        },
+        matchResult: { sceneAssets: {} },
+      } as unknown as AgentState;
+    }
+
+    /* 1) 9s 总时长≤15s 上限 → 只建一次任，三个镜头指向同一素材 */
+    const state = makeState(3000);
+    const upd = await NODE_RUNNERS['generate-clips'](state, deps);
+    if (calls.length !== 1) throw new Error(`应只建 1 次任务（一镜到底），实际 ${calls.length} 次`);
+    if (Math.round(calls[0]!.durationSec ?? 0) !== 9) throw new Error(`整段时长应为 9s，实际 ${calls[0]?.durationSec}`);
+    if (!calls[0]!.prompt.includes('一镜到底')) throw new Error('整段 prompt 未说明一镜到底');
+    if (!calls[0]!.prompt.includes('同一个主体')) throw new Error('整段 prompt 缺主体锚点');
+    const assets = upd.scannedAssets ?? [];
+    if (assets.length !== 1) throw new Error(`应只新增 1 个素材，实际 ${assets.length}`);
+    if (!(assets[0]!.tags ?? []).includes(AI_TIMELINE_TAG)) throw new Error('整段素材缺 ai-timeline 标记');
+    const mapped = Object.values(upd.matchResult!.sceneAssets);
+    if (new Set(mapped).size !== 1 || mapped.length !== 3) {
+      throw new Error(`三个镜头应共用同一素材，实际 ${JSON.stringify(mapped)}`);
+    }
+
+    /* 2) assemble：共用素材的入点必须逐镜头往后推，否则全在重播开头 */
+    const nextState = { ...state, scannedAssets: assets, matchResult: upd.matchResult } as AgentState;
+    const assembled = await NODE_RUNNERS['assemble-timeline'](nextState, deps);
+    const videoTrack = assembled.project!.tracks.find((track) => track.type === 'video');
+    const clips = (videoTrack?.clips ?? []) as Array<{ offset: number; duration: number }>;
+    if (clips.length !== 3) throw new Error(`应有 3 个视频片段，实际 ${clips.length}`);
+    const offsets = clips.map((clip) => clip.offset);
+    if (offsets.join(',') !== '0,3000,6000') {
+      throw new Error(`整段素材入点应递增为 0/3000/6000，实际 ${offsets.join(',')}`);
+    }
+
+    /* 3) 超出模型单次上限 → 退回逐镜头，不能静默截断 */
+    calls.length = 0;
+    const longState = makeState(6000);
+    await NODE_RUNNERS['generate-clips'](longState, deps);
+    if (calls.length !== 3) throw new Error(`18s 超出 15s 上限应退回逐镜头（3 次），实际 ${calls.length} 次`);
+
+    results.push(ok(name, '9s 三镜头→1 次建任+单素材共用；入点 0/3/6s 递增；超上限自动逐镜头'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  }
+}
+
+/**
  * 编辑器属性真实接线：面板字段（scale/rotation/opacity/volume/muted）经 bridge 回写工程，
  * 渲染链消费（scale/rotate/colorchannelmixer/volume），往返不漂移；静音片段不接入混音。
  */
@@ -2296,6 +2400,9 @@ export async function runSmoke(): Promise<RingResult[]> {
 
   // R2 对话式剪辑：计划解析与 ref 落地
   ringAssistantPlan(results);
+
+  // 整段一镜到底生成与共用素材入点
+  await ringWholeShotGeneration(results);
 
   return results;
 }

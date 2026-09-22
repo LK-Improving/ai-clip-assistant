@@ -1,4 +1,5 @@
-import { dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, extname } from 'node:path';
 import {
   planEdits,
   type AssistantAction,
@@ -7,6 +8,7 @@ import {
   type VideoGenRatio,
 } from '@miaoma/agent';
 import { addAllowedPath } from '../protocol';
+import { generateThumbnail } from './thumbnail';
 import { broadcastAgentLog, getVideoGenProvider, resolveLlm } from './agent';
 import { loadVideoGenConfig } from './video-gen/config';
 
@@ -130,12 +132,27 @@ export interface GenerateOutcome {
   error?: string;
 }
 
+/** 本地图片 → data URI（MiniMax content.image_url 支持 data:image/<格式>;base64,）；超 4MB 放弃 */
+function toImageDataUri(imagePath: string): string | null {
+  try {
+    const buf = readFileSync(imagePath);
+    if (buf.length === 0 || buf.length > 4 * 1024 * 1024) return null;
+    const ext = extname(imagePath).replace(/^\./, '').toLowerCase();
+    const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+    return `data:${mime};base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * 逐段执行 AI 生视频（用户在确认卡片上点过之后才会走到这里）。
  *
  * - 串行生成并广播进度日志：单段 1–3 分钟，不回报进度用户会以为卡死；
  * - 单段失败只记该段，但配置类错误（模型未开通 / Key 无效）直接停掉后续段，
  *   否则会像之前那样「每段白等 10 分钟 + 每段照扣钱」；
+ * - 跨段一致性：第一段成功后抽一帧作为后续段的参考图（与流水线 generate-clips 同一机制），
+ *   否则一次生成多段就是各自抽卡，主体会漂；
  * - 产物父目录登记进 miaoma:// 白名单，否则编辑器预览会 403。
  */
 export async function generateAssistantClips(items: GenerateItem[]): Promise<GenerateOutcome[]> {
@@ -150,6 +167,7 @@ export async function generateAssistantClips(items: GenerateItem[]): Promise<Gen
     }));
   }
 
+  let referenceImage: string | null = null;
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i]!;
     broadcastAgentLog(`[assistant] 生成第 ${i + 1}/${items.length} 段：${item.prompt.slice(0, 30)}…`);
@@ -158,6 +176,7 @@ export async function generateAssistantClips(items: GenerateItem[]): Promise<Gen
         prompt: item.prompt,
         durationSec: item.durationSec,
         ratio: item.ratio ?? '16:9',
+        referenceImage: referenceImage ?? undefined,
       });
       addAllowedPath(dirname(res.videoPath));
       broadcastAgentLog(`[assistant] 第 ${i + 1} 段完成：${res.videoPath}`);
@@ -169,6 +188,20 @@ export async function generateAssistantClips(items: GenerateItem[]): Promise<Gen
         height: res.height,
         ext: res.ext,
       };
+      if (!referenceImage && items.length > 1) {
+        try {
+          const frame = await generateThumbnail(res.videoPath, {
+            atMs: Math.min(1500, Math.max(0, res.durationMs - 500)),
+            width: 1280,
+          });
+          referenceImage = toImageDataUri(frame);
+          if (referenceImage) {
+            broadcastAgentLog('[assistant] 已取第 1 段帧作为后续段的主体参考图（跨段锁主体）');
+          }
+        } catch {
+          // 抽帧失败不阻断生成，后续段仅靠 prompt 自身描述维持一致
+        }
+      }
     } catch (error) {
       const err = error as Error & { configError?: boolean };
       results[i] = { ok: false, error: err.message };

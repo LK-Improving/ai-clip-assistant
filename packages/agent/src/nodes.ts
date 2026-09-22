@@ -24,6 +24,7 @@ import type {
   VideoClip,
   VideoTrack,
 } from '@miaoma/video-project';
+import type { VideoGenResult } from './video-gen';
 import { PIPELINE_NODES } from './constants';
 import { offlineBriefJson, offlineStoryboardJson } from './llm';
 import { cosine, embedAsset, embedText, preprocessAssetSemantic } from './semantic';
@@ -396,6 +397,71 @@ function toImageDataUri(imagePath: string): string | null {
  *   全部失败或遇配置/超时类错误则中断（见下）。
  * - 一致性：每段 prompt 都拼上主体锚点前缀，并从第一段产物抽帧作为后续段的参考图（锁主体）。
  */
+/**
+ * 整段（一镜到底）生成素材的标记。
+ *
+ * 逐镜头独立抽卡最大的问题是主体与光线跨段不一致（用户反馈“三只不一样的猫”）。
+ * 当待生成镜头总时长在模型单次上限内时，合成一条 prompt 一次生成整段视频，
+ * 全部镜头指向同一素材；assemble 阶段靠这个标记把入点按累计时长往后推，
+ * 拼出来就是一条连续画面。
+ */
+export const AI_TIMELINE_TAG = 'ai-timeline';
+
+/** 生成产物 → Asset：真实分辨率/时长以文件为准（Provider 只能按请求档位估算） */
+async function buildGeneratedAsset(
+  res: VideoGenResult,
+  deps: AgentDeps,
+  name: string,
+  description: string,
+  tags: string[],
+): Promise<VideoAsset> {
+  let width = res.width ?? 1920;
+  let height = res.height ?? 1080;
+  let durationMs = Math.max(1, res.durationMs);
+  try {
+    const probed = await deps.probe(res.videoPath);
+    if (probed.width && probed.height) {
+      width = probed.width;
+      height = probed.height;
+    }
+    if (probed.durationMs > 0) durationMs = probed.durationMs;
+  } catch {
+    // 探测失败沿用 Provider 估算值，不阻断成片
+  }
+  const asset: VideoAsset = {
+    id: createId(),
+    name,
+    path: res.videoPath,
+    addedAt: nowIso(),
+    type: 'video',
+    duration: durationMs,
+    width,
+    height,
+    hasAudio: true,
+    tags,
+    // 语义预处理：把画面描述写进素材，二次编辑时检索/匹配可命中
+    description: description.slice(0, 200),
+  };
+  asset.embedding = embedAsset(asset);
+  return asset;
+}
+
+/** 从第一段成功产物抽一帧作后续段的参考图（跨段锁主体）；不具备能力时静默退化 */
+async function captureReferenceFrame(
+  deps: AgentDeps,
+  videoPath: string,
+  durationMs: number,
+): Promise<string | null> {
+  if (!deps.extractFrame) return null;
+  try {
+    const frame = await deps.extractFrame(videoPath, Math.min(1500, Math.max(0, durationMs - 500)));
+    return frame ? toImageDataUri(frame) : null;
+  } catch (e) {
+    deps.logger?.(`[gen-clips] 抽参考帧失败，后续段仅靠文本锚点维持一致：${(e as Error).message}`);
+    return null;
+  }
+}
+
 export async function generateClips(state: AgentState, deps: AgentDeps): Promise<NodeUpdate> {
   const vg = deps.videoGen;
   if (!vg || !vg.isConfigured()) {
@@ -410,17 +476,68 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
   const canvas = state.brief?.canvas;
   const ratio: '16:9' | '9:16' | '1:1' =
     canvas && canvas.height > canvas.width ? '9:16' : canvas && canvas.width === canvas.height ? '1:1' : '16:9';
+  const anchor = subjectAnchor(state);
 
+  // 需要 AI 生成的镜头（没匹配到真实素材的）
+  const pending = storyboard.scenes.filter((scene) => !sceneAssets[scene.order]);
+
+  /* ===== 优先一镜到底：多个镜头合成一条 prompt 一次生成 ===== */
+  if (pending.length >= 2) {
+    const totalMs = pending.reduce((sum, scene) => sum + scene.durationMs, 0);
+    const maxSec = vg.maxDurationSec ?? 0;
+    if (maxSec > 0 && Math.ceil(totalMs / 1000) <= maxSec) {
+      let cursorMs = 0;
+      const script = pending
+        .map((scene) => {
+          const from = (cursorMs / 1000).toFixed(1);
+          cursorMs += scene.durationMs;
+          const to = (cursorMs / 1000).toFixed(1);
+          const text = (scene.description || scene.title || scene.narration || '').trim();
+          return text ? `${from}-${to}s：${text}` : '';
+        })
+        .filter(Boolean)
+        .join('；');
+      const prompt = [anchor, `按下列时间顺序一镜到底完成整段画面，中途不切换主体与场景：${script}`]
+        .filter(Boolean)
+        .join('。')
+        .slice(0, 1600);
+      deps.logger?.(
+        `[gen-clips] 一镜到底模式：${pending.length} 个镜头合成 1 条 ${Math.round(totalMs / 1000)}s 视频（避免逐段抽卡导致主体漂移）`,
+      );
+      try {
+        const res = await vg.generate({ prompt, durationSec: totalMs / 1000, ratio });
+        const asset = await buildGeneratedAsset(
+          res,
+          deps,
+          `AI生成-整段.${res.ext}`,
+          prompt.slice(0, 200),
+          ['ai-generated', AI_TIMELINE_TAG],
+        );
+        for (const scene of pending) sceneAssets[scene.order] = asset.id;
+        addedAssets.push(asset);
+        deps.logger?.(`[gen-clips] 整段生成完成：${res.videoPath}`);
+        return {
+          scannedAssets: [...state.scannedAssets, ...addedAssets],
+          matchResult: { sceneAssets },
+        };
+      } catch (e) {
+        // 整段失败不拖垮成片：退回逐镜头抽卡（带主体锚点与参考图）
+        deps.logger?.(`[gen-clips] 整段生成失败，退回逐镜头模式：${(e as Error).message}`);
+      }
+    } else {
+      deps.logger?.(
+        `[gen-clips] 逐镜头模式：待生成 ${Math.round(totalMs / 1000)}s 超出模型单次上限${maxSec ? ` ${maxSec}s` : '（未声明上限）'}`,
+      );
+    }
+  }
+
+  /* ===== 逐镜头生成（回退路径，或只有 1 个镜头待生成） ===== */
   let generated = 0;
   let attempted = 0;
   let firstFailure: (Error & { configError?: boolean; stopOnFailure?: boolean }) | null = null;
-  const anchor = subjectAnchor(state);
   /** 锁主体参考图：固定用第一段成功产物的一帧（逐段更新会累积漂移） */
   let referenceImage: string | null = null;
-  for (const scene of storyboard.scenes) {
-    const existing = sceneAssets[scene.order];
-    if (existing) continue; // 已有真实素材，不必 AI 生成
-
+  for (const scene of pending) {
     const sceneText = (scene.description || scene.title || scene.narration || state.requirement).trim();
     // 锚点在前：超长被截时先丢场景细节，不会丢掉主体约束（MiniMax 文本上限 2000 字符）
     const prompt = [anchor, sceneText].filter(Boolean).join('。').slice(0, 1600);
@@ -434,52 +551,15 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
         ratio,
         referenceImage: referenceImage ?? undefined,
       });
-      // 产物真实分辨率/时长以文件为准：Provider 只能按请求档位估算
-      //（实测 MiniMax H3 请 16:9 + 2K 实际回 2560x1440、请 4s 实际 4.46s）
-      let width = res.width ?? 1920;
-      let height = res.height ?? 1080;
-      let durationMs = Math.max(1, res.durationMs);
-      try {
-        const probed = await deps.probe(res.videoPath);
-        if (probed.width && probed.height) {
-          width = probed.width;
-          height = probed.height;
-        }
-        if (probed.durationMs > 0) durationMs = probed.durationMs;
-      } catch {
-        // 探测失败沿用 Provider 估算值，不阻断成片
-      }
-      const asset: Asset = {
-        id: createId(),
-        name: `AI生成-${scene.order + 1}.${res.ext}`,
-        path: res.videoPath,
-        addedAt: nowIso(),
-        type: 'video',
-        duration: durationMs,
-        width,
-        height,
-        hasAudio: true,
-        tags: ['ai-generated'],
-        // 语义预处理：把场景画面描述写进素材，二次编辑时检索/匹配可命中
-        description: (scene.description || scene.title).slice(0, 200),
-      };
-      asset.embedding = embedAsset(asset);
+      const asset = await buildGeneratedAsset(res, deps, `AI生成-${scene.order + 1}.${res.ext}`, scene.description || scene.title, ['ai-generated']);
       sceneAssets[scene.order] = asset.id;
       addedAssets.push(asset);
       generated += 1;
       deps.logger?.(`[gen-clips] 场景 ${scene.order} 生成视频：${res.videoPath}`);
-      // 第一段成功后抽一帧作为后续场景的参考图（跨段锁主体）；
-      // 未注入抽帧能力、或图过大时静默退化为纯文本锚点一致性
-      if (!referenceImage && deps.extractFrame) {
-        try {
-          const frame = await deps.extractFrame(res.videoPath, Math.min(1500, Math.max(0, durationMs - 500)));
-          const uri = frame ? toImageDataUri(frame) : null;
-          if (uri) {
-            referenceImage = uri;
-            deps.logger?.('[gen-clips] 已取第 1 段产物帧作为后续场景的主体参考图（跨段锁主体）');
-          }
-        } catch (e) {
-          deps.logger?.(`[gen-clips] 抽参考帧失败，后续段仅靠文本锚点维持一致：${(e as Error).message}`);
+      if (!referenceImage) {
+        referenceImage = await captureReferenceFrame(deps, res.videoPath, asset.duration);
+        if (referenceImage) {
+          deps.logger?.('[gen-clips] 已取第 1 段产物帧作为后续场景的主体参考图（跨段锁主体）');
         }
       }
     } catch (e) {
@@ -636,6 +716,12 @@ export async function assembleTimeline(state: AgentState, deps: AgentDeps): Prom
   };
 
   let cursor = 0;
+  /**
+   * 整段素材的已消耗时长。一镜到底生成的那条长视频会被多个镜头共用，
+   * 每个镜头的素材内入点必须接着上一镜头往后推，否则全部在重播开头几秒
+   *（offset 曾硬编码为 0，这是“多镜头共用一条素材”能成立的必要条件）。
+   */
+  const wholeShotConsumed = new Map<string, number>();
   for (const scene of storyboard.scenes) {
     const assetId = matchResult.sceneAssets[scene.order] ?? null;
     const asset = assetId ? state.scannedAssets.find((a) => a.id === assetId) ?? null : null;
@@ -653,13 +739,17 @@ export async function assembleTimeline(state: AgentState, deps: AgentDeps): Prom
         // AI 生成的 B-roll 自带原生立体声音轨（MiniMax H3 等），为避免与旁白轨（TTS）互相打架，
         // 把其音量压低到 0.35，让旁白成为场景主声；真实素材保持原音量。
         const isAiGen = asset.tags?.includes('ai-generated') ?? false;
+        const wholeShot = asset.tags?.includes(AI_TIMELINE_TAG) ?? false;
+        const usedMs = Math.min(seg, assetDurationMs ?? seg);
+        const inPointMs = wholeShot ? wholeShotConsumed.get(asset.id) ?? 0 : 0;
+        if (wholeShot) wholeShotConsumed.set(asset.id, inPointMs + usedMs);
         videoClips.push({
           id: createId(),
           type: 'video',
           assetId: asset.id,
           start: cursor,
-          duration: Math.min(seg, assetDurationMs ?? seg),
-          offset: 0,
+          duration: usedMs,
+          offset: inPointMs,
           speed: 1,
           locked: false,
           enabled: true,

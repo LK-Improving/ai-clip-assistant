@@ -23,6 +23,6 @@ export * from './deps';
 export { AgentStateAnnotation, toAgentState } from './graph-state';
 export type { GraphStateType } from './graph-state';
 export { JsonFileCheckpointSaver } from './checkpointer';
-export { NODE_RUNNERS, applyAutoTransitions, splitCaption } from './nodes';
+export { NODE_RUNNERS, AI_TIMELINE_TAG, applyAutoTransitions, splitCaption } from './nodes';
 export type { NodeUpdate } from './nodes';
 export { runPipeline, resumeFromCheckpoint, saveCheckpoint, loadCheckpoint, PipelineError } from './pipeline';
