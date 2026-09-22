@@ -21,9 +21,11 @@ export function clipRef(track: TimelineTrack, index: number): string {
 export function buildTimelineSnapshot(
   tracks: TimelineTrack[],
   selection: TimelineSelection | null,
+  playheadMs = 0,
 ): AssistantTimelineSnapshot {
   const snapshot: AssistantTimelineSnapshot = {
     totalMs: Math.round(timelineTotalMsFor(tracks)),
+    playheadMs: Math.round(Math.max(0, playheadMs)),
     selectedRef: selection ? findRefFor(selection, tracks) : null,
     tracks: tracks.map((track) => ({
       id: track.id,
@@ -36,6 +38,8 @@ export function buildTimelineSnapshot(
         durationMs: Math.round(clip.duration),
         volume: clip.volume,
         muted: clip.muted,
+        content: clip.content,
+        selected: selection?.trackId === track.id && selection?.clipId === clip.id,
       })),
     })),
   };
@@ -138,8 +142,22 @@ export interface PlanTranslation {
   seekMs: number | null;
   /** 需要先去素材库检索（异步）才能变成 addClip 的插件请求 */
   inserts: PendingInsert[];
+  /** 需要先去调 AI 生视频（异步、花钱）才能变成 addClip 的生成请求 */
+  generations: PendingGenerate[];
   /** 本批是否包含「撤销上一次改动」 */
   undo: boolean;
+}
+
+/** 待生成的片段：确认后由主进程串行调 Provider，产物回来再入轨 */
+export interface PendingGenerate {
+  prompt: string;
+  durationSec: number;
+  /** 生成结果永远落在视频轨 */
+  trackId: string;
+  /** 顶替的旧片段（ref 只表示「替哪个镜头」，它可能在别的轨道上） */
+  replaceTrackId: string | null;
+  replaceClipId: string | null;
+  startMs: number | null;
 }
 
 /** 待解析的插件：模型只说“找什么”，选件由本地检索完成 */
@@ -164,6 +182,7 @@ export function translatePlan(
   const lines: string[] = [];
   const notes: string[] = [];
   const inserts: PendingInsert[] = [];
+  const generations: PendingGenerate[] = [];
   let seekMs: number | null = null;
   let undo = false;
 
@@ -192,6 +211,38 @@ export function translatePlan(
       lines.push(
         `从素材库找「${action.query}」插入到「${track.name}」${
           action.startMs !== undefined ? ` 的 ${seconds(action.startMs)}` : ' 末尾'
+        }`,
+      );
+      continue;
+    }
+
+    // generateClip 必须在拿 located 之前处理：它的 ref 是可选的
+    if (action.type === 'generateClip') {
+      // 生成结果只能落在视频轨；ref 只决定「顶替哪个镜头」与沿用它的位置/时长
+      const videoTrack = tracks.find((item) => item.kind === 'video');
+      if (!videoTrack) {
+        notes.push('时间线里没有视频轨，无法放入生成的画面（可先点「+ 视频轨」）。');
+        continue;
+      }
+      const target = action.ref ? resolveClipRef(action.ref, tracks, selection) : null;
+      if (action.ref && !target) {
+        notes.push(`没找到片段「${action.ref}」，这条生成请求已跳过。`);
+        continue;
+      }
+      const targetTrack = target ? tracks.find((item) => item.id === target.trackId) : undefined;
+      const clip = target && targetTrack ? targetTrack.clips.find((item) => item.id === target.clipId) : undefined;
+      const durationSec = Math.max(1, Math.round(action.durationSec ?? (clip ? clip.duration / 1000 : 5)));
+      generations.push({
+        prompt: action.prompt,
+        durationSec,
+        trackId: videoTrack.id,
+        replaceTrackId: clip && targetTrack ? targetTrack.id : null,
+        replaceClipId: clip?.id ?? null,
+        startMs: clip ? Math.round(clip.start) : null,
+      });
+      lines.push(
+        `AI 生成一段「${action.prompt.slice(0, 24)}${action.prompt.length > 24 ? '…' : ''}」约 ${durationSec}s${
+          clip ? `，顶替「${clip.name}」` : `，追加到「${videoTrack.name}」末尾`
         }`,
       );
       continue;
@@ -288,5 +339,5 @@ export function translatePlan(
     lines.push(`修改「${clip.name}」→ ${changes}`);
   }
 
-  return { actions, lines, notes, seekMs, inserts, undo };
+  return { actions, lines, notes, seekMs, inserts, generations, undo };
 }

@@ -1,5 +1,5 @@
 import { Download, Import, Scissors, Sparkles } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AssetPanel, type LibraryAsset } from '@/components/editor/asset-panel';
 import { Preview } from '@/components/editor/preview';
 import { PropertyPanel } from '@/components/editor/property-panel';
@@ -12,7 +12,7 @@ import {
   useTimelineSelection,
   useTimelineTracks,
 } from '@/hooks/use-timeline';
-import { nextFreeStart, onSeekRequest, undoTimeline } from '@/lib/timeline-store';
+import { nextFreeStart, onSeekRequest, reportPlayhead, undoTimeline } from '@/lib/timeline-store';
 import {
   formatTimecode,
   timelineTotalMs,
@@ -41,6 +41,16 @@ export default function EditorPage() {
 
   // 与时间线底部「总时长」同一个口径（之前这里硬兜底 30s，导致预览区比实际作品长一截）
   const totalMs = useMemo(() => timelineTotalMs(tracks), [tracks]);
+
+  // 播放头低频上报给 store：AI 助手要把「在这里切开」「从当前位置」翻译成毫秒。
+  // 只在停止播放时立即上报，播放中每 400ms 最多一次（reportPlayhead 不广播，不影响渲染循环）
+  const lastReportRef = useRef(0);
+  useEffect(() => {
+    const now = performance.now();
+    if (playing && now - lastReportRef.current < 400) return;
+    lastReportRef.current = now;
+    reportPlayhead(currentMs);
+  }, [currentMs, playing]);
 
   // 外部（AI 助手）发起的播放头跳转：currentMs 是高频值不进 store，走事件通道
   useEffect(

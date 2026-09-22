@@ -296,6 +296,23 @@ export function bindTimelineToActiveProject(): () => void {
  */
 export const SEEK_EVENT = 'miaoma:seek';
 
+/**
+ * 播放头低频上报：编辑器 rAF 里每过一段时间写一次，只存值不广播。
+ *
+ * AI 助手要把「在这里切开」「从当前位置」翻译成毫秒，需要知道播放头在哪；
+ * 但 currentMs 是每帧变的高频值，进订阅状态会让所有订阅者 60fps 重渲染。
+ * 因此这里只做一个不触发 emit 的快照，读到的位是“最近一次上报”的近似值（足够定位意图）。
+ */
+let playheadMs = 0;
+
+export function reportPlayhead(ms: number): void {
+  playheadMs = Math.max(0, Math.round(ms));
+}
+
+export function getPlayheadMs(): number {
+  return playheadMs;
+}
+
 export function requestSeek(ms: number): void {
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent<{ ms: number }>(SEEK_EVENT, { detail: { ms } }));

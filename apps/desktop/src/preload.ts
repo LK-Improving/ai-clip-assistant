@@ -10,8 +10,9 @@ import type { TtsConfig } from './main/services/tts/config';
 import type { TtsRequest, TtsResult } from './main/services/tts';
 import type { Project } from '@miaoma/video-project';
 import type { PipelineNode, StoryboardScene } from '@miaoma/agent';
-import type { AssistantTimelineSnapshot, EditPlan } from '@miaoma/agent';
+import type { AssistantTimelineSnapshot } from '@miaoma/agent';
 import type { AgentSnapshot } from './main/services/agent';
+import type { AssistantPlanResult, GenerateItem, GenerateOutcome } from './main/services/assistant';
 import type { LlmConfig } from './main/services/llm/config';
 import type { VideoGenConfig } from './main/services/video-gen/config';
 import type { ExportQuality } from './lib/export-request';
@@ -181,8 +182,12 @@ const api = {
    * 主进程只出计划，ref 解析、用户确认与执行都在渲染进程的时间线 store 里做。
    */
   assistant: {
-    plan: (input: { message: string; snapshot: AssistantTimelineSnapshot }): Promise<EditPlan> =>
+    /** 自然语言 → 改动计划（含花钱动作的费用预估） */
+    plan: (input: { message: string; snapshot: AssistantTimelineSnapshot }): Promise<AssistantPlanResult> =>
       ipcRenderer.invoke('assistant:plan', input),
+    /** 逐段执行 AI 生视频（仅用户确认后调用） */
+    generateClips: (items: GenerateItem[]): Promise<GenerateOutcome[]> =>
+      ipcRenderer.invoke('assistant:generate-clips', items),
   },
 
   videoGen: {

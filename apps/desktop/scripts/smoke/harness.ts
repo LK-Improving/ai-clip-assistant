@@ -60,6 +60,7 @@ import { probeMedia } from '../../src/main/services/probe';
 import { createAgentDeps, resumeAgentRun, retryAgentRun, startAgentRun } from '../../src/main/services/agent';
 import { HttpTaskVideoProvider, MiniMaxH3VideoProvider, NODE_RUNNERS, listRemoteModelIds, minimaxAlternateBase, parseEditPlan, toVideoGenError } from '@miaoma/agent';
 import { buildTimelineSnapshot, resolveClipRef, translatePlan } from '../../src/lib/assistant-apply';
+import { estimatePlanCost } from '../../src/main/services/assistant';
 import { applyTimelineActions, canUndo, getTracks, undoTimeline } from '../../src/lib/timeline-store';
 import type { TimelineClip, TimelineTrack } from '../../src/lib/timeline-utils';
 import type { AgentDeps, AgentState } from '@miaoma/agent';
@@ -1541,6 +1542,7 @@ async function ringCustomProviders(results: RingResult[]): Promise<void> {
  */
 function ringAssistantPlan(results: RingResult[]): void {
   const name = 'R2·对话式剪辑计划与 ref 解析';
+  const originalVg = loadVideoGenConfig();
   try {
     const clip = (id: string, label: string, start: number, duration: number): TimelineClip => ({
       id,
@@ -1650,9 +1652,75 @@ function ringAssistantPlan(results: RingResult[]): void {
     applyTimelineActions([{ type: 'removeClip', trackId: 'no-such-track', clipId: 'no-such-clip' }]);
     if (canUndo()) throw new Error('全部跳过的批次不应压撤销栈');
 
-    results.push(ok(name, '快照按时间编号 / 四种 ref 写法解析 / 切分与插件展开 / 幻觉 ref 逐条跳过 / 非法计划抛错重试 / 批量改动能整批撤销'));
+    // 上下文注入：播放头、选中标记、字幕文本都要进快照，否则「在这里切开」无从翻译
+    const rich = buildTimelineSnapshot(tracks, selection, 4200);
+    if (rich.playheadMs !== 4200) throw new Error(`playheadMs 未注入：${rich.playheadMs}`);
+    if (rich.tracks[0]?.clips[1]?.selected !== true) throw new Error('选中片段未标记 selected');
+    if (rich.tracks[0]?.clips[0]?.selected === true) throw new Error('未选中片段不应被标记');
+
+    // generateClip：结果只能落视频轨（无视频轨全拦下）；带 ref 时顶替目标镜头并沿用其位置
+    const genPlan = parseEditPlan({
+      reply: '生成两段',
+      actions: [
+        { type: 'generateClip', prompt: '猫抬头说好吃', durationSec: 5, ref: '音乐轨#2' },
+        { type: 'generateClip', prompt: '猫走开' },
+      ],
+    });
+    const genT = translatePlan(genPlan, tracks, selection);
+    if (genT.generations.length !== 0) throw new Error(`没有视频轨时生成都应被拦下，实际放行 ${genT.generations.length}`);
+    if (!genT.notes.some((n) => /没有视频轨/.test(n))) throw new Error('缺视频轨时 generateClip 应给可行动提示');
+    const withVideoTrack: TimelineTrack[] = [
+      ...tracks,
+      { id: 't-video', kind: 'video', name: '视频轨', clips: [{ id: 'v1', name: 'clip-a.mp4', kind: 'video', start: 1000, duration: 4000, offset: 0, hue: 3, assetPath: 'C:/m/clip-a.mp4' }] },
+    ];
+    const genT2 = translatePlan(
+      parseEditPlan({ reply: '顶替', actions: [{ type: 'generateClip', prompt: '猫抬头说好吃', durationSec: 5, ref: '视频轨#1' }] }),
+      withVideoTrack,
+      selection,
+    );
+    const gen = genT2.generations[0];
+    if (
+      !gen ||
+      gen.replaceClipId !== 'v1' ||
+      gen.replaceTrackId !== 't-video' ||
+      gen.startMs !== 1000 ||
+      gen.trackId !== 't-video' ||
+      gen.durationSec !== 5
+    ) {
+      throw new Error(`generateClip 顶替目标解析异常：${JSON.stringify(gen)}`);
+    }
+    // 顶替音频轨上的镜头：结果仍入视频轨，删除动作落在旧片段所在轨
+    const crossTrack = translatePlan(
+      parseEditPlan({ reply: '顶替', actions: [{ type: 'generateClip', prompt: '猫抬头', durationSec: 4, ref: '音乐轨#1' }] }),
+      withVideoTrack,
+      selection,
+    );
+    const cross = crossTrack.generations[0];
+    if (!cross || cross.trackId !== 't-video' || cross.replaceTrackId !== 't-audio' || cross.replaceClipId !== 'c1') {
+      throw new Error(`跨轨顶替解析异常：${JSON.stringify(cross)}`);
+    }
+
+    // 费用护栏：MiniMax 按已核实单价算出金额（本批两段各 5s = 10s × 0.8 = 8 元）；
+    // 未知单价/未知 Provider 给 null + 提示，绝不在卡片上编数字
+    saveVideoGenConfig({ ...originalVg, active: 'minimax', minimax: { ...originalVg.minimax, apiKey: 'k', resolution: '2K' } });
+    const cost = estimatePlanCost(genPlan, buildTimelineSnapshot(withVideoTrack, selection, 0));
+    if (!cost || cost.yuan !== 8 || cost.seconds !== 10) {
+      throw new Error(`2K 单价 0.8 元/秒 × 两段各 5s 应为 8 元，实际 ${JSON.stringify(cost)}`);
+    }
+    saveVideoGenConfig({ ...originalVg, active: 'seedance' });
+    const unknown = estimatePlanCost(genPlan, buildTimelineSnapshot(withVideoTrack, selection, 0));
+    if (!unknown || unknown.yuan !== null || !/计费页/.test(unknown.note)) {
+      throw new Error(`未内置单价的 Provider 应返回 null + 提示，实际 ${JSON.stringify(unknown)}`);
+    }
+    if (estimatePlanCost({ reply: 'x', actions: [{ type: 'seekTo', startMs: 0 }] }, buildTimelineSnapshot(withVideoTrack, null, 0)) !== null) {
+      throw new Error('没有生成动作时不应给费用预估');
+    }
+
+    results.push(ok(name, '快照含播放头/选中/字幕上下文 / 四种 ref 写法解析 / 切分、插件、生成展开 / 费用预估不编数字 / 幻觉 ref 逐条跳过 / 批量改动整批撤销'));
   } catch (e) {
     results.push(fail(name, (e as Error).message));
+  } finally {
+    saveVideoGenConfig(originalVg);
   }
 }
 

@@ -17,7 +17,8 @@ import type { Project } from '@miaoma/video-project';
 import type { StoryboardScene } from '@miaoma/agent';
 import { listRemoteModelIds } from '@miaoma/agent';
 import { cancelAgentRun, getAgentStatus, resumeAgentRun, retryAgentRun, startAgentRun } from './services/agent';
-import { planAssistantEdit } from './services/assistant';
+import { generateAssistantClips, planAssistantEdit } from './services/assistant';
+import type { GenerateItem } from './services/assistant';
 import { addVoice, listVoices, removeVoice } from './services/voice';
 import { visionStatus } from './services/vision';
 import {
@@ -282,6 +283,14 @@ export function registerIpc(): void {
    */
   ipcMain.handle('assistant:plan', (_event, input: Parameters<typeof planAssistantEdit>[0]) =>
     planAssistantEdit(input),
+  );
+
+  /**
+   * AI 助手：逐段执行 AI 生视频（花钱动作）。
+   * 只在渲染进程展示确认卡片、用户点「确认应用」后才会被调用。
+   */
+  ipcMain.handle('assistant:generate-clips', (_event, items: GenerateItem[]) =>
+    generateAssistantClips(Array.isArray(items) ? items : []),
   );
 
   // ===== 视频生成模型（阶段五补充，2026-09-15） =====

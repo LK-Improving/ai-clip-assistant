@@ -258,6 +258,11 @@ function resolveVideoGen(logger?: (msg: string) => void): VideoGenProvider {
 /** 按配置指纹缓存 Provider，只在配置真变了时重建并记一行日志 */
 let videoGenCache: { key: string; provider: VideoGenProvider } | null = null;
 
+/** 导出给 AI 助手：对话里的 generateClip 要用同一个 Provider 与同一套设置中心配置 */
+export function getVideoGenProvider(): VideoGenProvider {
+  return resolveVideoGenCached();
+}
+
 function resolveVideoGenCached(logger?: (msg: string) => void): VideoGenProvider {
   const key = JSON.stringify(loadVideoGenConfig());
   if (videoGenCache && videoGenCache.key === key) return videoGenCache.provider;
@@ -314,6 +319,15 @@ let eventSeq = 0;
 function broadcast(payload: unknown): void {
   const enriched = { seq: ++eventSeq, ...(payload as Record<string, unknown>) };
   for (const win of BrowserWindow.getAllWindows()) win.webContents.send('agent:event', enriched);
+}
+
+/**
+ * 向渲染层补一条日志事件（AI 助手逐段生成视频时用）。
+ *
+ * 复用 agent:event 通道与同一个自增 seq，否则渲染层会把它当成断档去拉快照。
+ */
+export function broadcastAgentLog(message: string): void {
+  broadcast({ type: 'log', message });
 }
 
 /** 失败语义：广播 error 事件（保留 checkpoint，前端可发起断点重试）后继续向上抛 */

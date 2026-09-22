@@ -5,8 +5,10 @@ import { ThumbPlaceholder } from '@/components/ui/misc';
 import { useApplyTimeline, useCanUndo, useTimelineSelection, useTimelineTracks, undoTimeline } from '@/hooks/use-timeline';
 import { getAgentSession, subscribeAgentSession } from '@/lib/agent-session';
 import type { AgentSessionState } from '@/lib/agent-session';
-import { buildTimelineSnapshot, translatePlan, type PendingInsert } from '@/lib/assistant-apply';
-import { nextFreeStart, requestSeek, trackForKind, type TimelineAction } from '@/lib/timeline-store';
+import { buildTimelineSnapshot, translatePlan, type PendingGenerate, type PendingInsert } from '@/lib/assistant-apply';
+import { getActiveProject } from '@/lib/active-project';
+import type { VideoGenCost } from '@/main/services/assistant';
+import { getPlayheadMs, nextFreeStart, requestSeek, trackForKind, type TimelineAction } from '@/lib/timeline-store';
 import { formatTimecode, timelineTotalMs, type TimelineClip, type TimelineTrack } from '@/lib/timeline-utils';
 import type { LibraryEntry } from '@/preload';
 import { cn } from '@/lib/utils';
@@ -36,7 +38,19 @@ interface PendingPlan {
   seekMs: number | null;
   /** 确认时才去素材库检索的插件（translatePlan 是同步的，检索异步） */
   inserts: PendingInsert[];
+  /** 确认时才调 AI 生视频（花钱 + 耗时，必须用户点过确认） */
+  generations: PendingGenerate[];
+  /** 本批生成动作的费用预估；单价未知时 yuan 为 null */
+  cost: VideoGenCost | null;
   undo: boolean;
+}
+
+/** 按工程画布推画幅比（与流水线 generate-clips 同一规则） */
+function ratioForCanvas(): '16:9' | '9:16' | '1:1' {
+  const canvas = getActiveProject().canvas;
+  if (canvas.height > canvas.width) return '9:16';
+  if (canvas.width === canvas.height) return '1:1';
+  return '16:9';
 }
 
 /**
@@ -184,12 +198,18 @@ export function AssistantDock({ route }: { route: string }) {
           } else {
             const plan = await api.assistant.plan({
               message: text,
-              snapshot: buildTimelineSnapshot(tracks, selection),
+              snapshot: buildTimelineSnapshot(tracks, selection, getPlayheadMs()),
             });
             const translated = translatePlan(plan, tracks, selection);
             push({ role: 'assistant', text: plan.reply });
             for (const note of translated.notes) push({ role: 'system', text: note });
-            if (translated.actions.length > 0 || translated.seekMs !== null || translated.inserts.length > 0 || translated.undo) {
+            const hasWork =
+              translated.actions.length > 0 ||
+              translated.seekMs !== null ||
+              translated.inserts.length > 0 ||
+              translated.generations.length > 0 ||
+              translated.undo;
+            if (hasWork) {
               setPending({
                 reply: plan.reply,
                 lines: translated.lines,
@@ -197,6 +217,8 @@ export function AssistantDock({ route }: { route: string }) {
                 actions: translated.actions,
                 seekMs: translated.seekMs,
                 inserts: translated.inserts,
+                generations: translated.generations,
+                cost: plan.cost ?? null,
                 undo: translated.undo,
               });
             } else if (!translated.lines.length) {
@@ -251,6 +273,55 @@ export function AssistantDock({ route }: { route: string }) {
       }
 
       if (pending.seekMs !== null) requestSeek(pending.seekMs);
+
+      // 生成动作：花钱且单段 1–3 分钟，只能在用户点过确认后走到这里
+      if (pending.generations.length) {
+        const api = window.electronAPI;
+        if (!api?.assistant?.generateClips) {
+          parts.push('需在桌面端才能调 AI 生视频');
+        } else {
+          const outcomes = await api.assistant.generateClips(
+            pending.generations.map((g) => ({ prompt: g.prompt, durationSec: g.durationSec, ratio: ratioForCanvas() })),
+          );
+          outcomes.forEach((outcome, i) => {
+            const want = pending.generations[i];
+            if (!want) return;
+            if (!outcome.ok || !outcome.videoPath) {
+              parts.push(`第 ${i + 1} 段生成失败：${outcome.error ?? '未知原因'}`);
+              return;
+            }
+            const track = tracks.find((item) => item.id === want.trackId) ?? trackForKind('video');
+            if (!track) {
+              parts.push(`第 ${i + 1} 段已生成但没有可放入的轨道`);
+              return;
+            }
+            const durationMs = outcome.durationMs ?? want.durationSec * 1000;
+            actions.push({
+              type: 'addClip',
+              trackId: track.id,
+              clip: {
+                name: `AI生成-${want.prompt.slice(0, 8)}.${outcome.ext ?? 'mp4'}`,
+                kind: 'video',
+                start: want.startMs ?? nextFreeStart(track),
+                duration: durationMs,
+                offset: 0,
+                hue: 280,
+                assetPath: outcome.videoPath,
+              },
+            });
+            // 顶替旧镜头：同批里一并删除，不留空洞（旧镜头可能在别的轨道上）
+            if (want.replaceClipId) {
+              actions.push({
+                type: 'removeClip',
+                trackId: want.replaceTrackId ?? track.id,
+                clipId: want.replaceClipId,
+              });
+            }
+            parts.push(`第 ${i + 1} 段已生成并入轨（${formatTimecode(durationMs)}）`);
+          });
+        }
+      }
+
       if (actions.length) {
         const result = applyActions(actions);
         if (result.applied > 0) parts.push(`已应用 ${result.applied} 项改动`);
@@ -409,6 +480,20 @@ export function AssistantDock({ route }: { route: string }) {
       {pending && (
         <div className="shrink-0 border-t border-primary/30 bg-primary/5 p-3">
           <p className="text-[11px] font-semibold text-primary">请确认以下改动（共 {pending.lines.length} 项）</p>
+          {pending.cost ? (
+            <p
+              className={cn(
+                'mt-1 rounded border px-2 py-1 text-[11px] leading-relaxed',
+                pending.cost.yuan !== null
+                  ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                  : 'border-input bg-secondary/40 text-muted-foreground',
+              )}
+            >
+              {pending.cost.yuan !== null
+                ? `费用预估：约 ${pending.cost.yuan.toFixed(2)} 元（共 ${pending.cost.seconds}s）— ${pending.cost.note}`
+                : `将调 AI 生成 ${pending.cost.seconds}s 视频 — ${pending.cost.note}`}
+            </p>
+          ) : null}
           <ul className="mt-1.5 space-y-1">
             {pending.lines.map((line, i) => (
               <li key={i} className="text-[11px] leading-relaxed">
