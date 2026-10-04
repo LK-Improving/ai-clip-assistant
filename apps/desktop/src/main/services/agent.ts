@@ -7,8 +7,10 @@ import {
   HttpTaskVideoProvider,
   INTERRUPT_NODE,
   MiniMaxH3VideoProvider,
+  OfflineImageGenProvider,
   OfflineTtsProvider,
   OfflineVideoGenProvider,
+  QwenImageProvider,
   resumeFromCheckpoint,
   runPipeline,
   type AgentChatModel,
@@ -20,6 +22,7 @@ import {
   type AgentTtsRequest,
   type AgentTtsResult,
   type Brief,
+  type ImageGenProvider,
   type MediaProbe,
   type PipelineNode,
   type StoryboardScene,
@@ -33,6 +36,7 @@ import { synthesizeSpeech, ttsStatus, zeroShotFallbackReason } from './tts';
 import { generateThumbnail } from './thumbnail';
 import { loadLlmConfig } from './llm/config';
 import { loadVideoGenConfig } from './video-gen/config';
+import { loadImageGenConfig } from './image-gen/config';
 
 /**
  * 阶段二：把 AI 智能体引擎（LangGraph 版）接进桌面端。
@@ -72,7 +76,7 @@ class DesktopTtsAdapter implements AgentTtsProvider {
           speed: req.speed,
           voiceId: req.voiceId,
         });
-        if (req.voiceId && res.provider !== 'zero-shot') {
+        if (req.voiceId && !res.provider.startsWith('zero-shot')) {
           this.logger?.(`[agent] 音色零样本链未命中：${zeroShotFallbackReason(req.voiceId) ?? '已回退常规音色'}`);
         }
         const data = readFileSync(res.audioPath);
@@ -187,6 +191,7 @@ export function createAgentDeps(logger?: (msg: string) => void): AgentDeps {
     llm: resolveLlm(logger),
     tts: new DesktopTtsAdapter(logger),
     videoGen: lazyVideoGen(logger),
+    imageGen: lazyImageGen(logger),
     probe: probeAdapter,
     // 跳段锁主体：从上一段 AI 产物抽一帧，作为下一段生成的参考图
     extractFrame: extractFrameAdapter,
@@ -293,6 +298,59 @@ function lazyVideoGen(logger?: (msg: string) => void): VideoGenProvider {
   };
 }
 
+/**
+ * 解析图像生成 Provider（P4a）：优先用「设置中心 → AI 设置 → 图像模型」的配置。
+ * 选了 qwen 但没填密钥时回退离线，storyboard-image 节点据此跳过关键帧。
+ */
+let imageGenCache: { key: string; provider: ImageGenProvider } | null = null;
+
+function resolveImageGenCached(logger?: (msg: string) => void): ImageGenProvider {
+  const key = JSON.stringify(loadImageGenConfig());
+  if (imageGenCache && imageGenCache.key === key) return imageGenCache.provider;
+  const provider = resolveImageGen(logger);
+  imageGenCache = { key, provider };
+  logger?.(`[agent] 图像生成 Provider：${provider.label}`);
+  return provider;
+}
+
+function resolveImageGen(logger?: (msg: string) => void): ImageGenProvider {
+  const cfg = loadImageGenConfig();
+  const imageDir = () => {
+    const dir = path.join(app.getPath('userData'), 'agent-image');
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  if (cfg.active === 'qwen') {
+    const apiKey = cfg.qwen.apiKey || process.env.DASHSCOPE_API_KEY || '';
+    if (apiKey) {
+      return new QwenImageProvider({
+        apiKey,
+        baseUrl: cfg.qwen.baseUrl || undefined,
+        textModel: cfg.qwen.textModel || 'qwen-image-3.0-pro',
+        editModel: cfg.qwen.editModel || 'qwen-image-edit-max',
+        workDir: imageDir(),
+        logger,
+      });
+    }
+    logger?.('[agent] 已选择千问图像但未填 apiKey，本次不生成关键帧');
+  }
+  return new OfflineImageGenProvider();
+}
+
+/** 懒解析图像 Provider：把选择推延到每次调用，设置中心改配置后下一镜即生效 */
+function lazyImageGen(logger?: (msg: string) => void): ImageGenProvider {
+  return {
+    get id() {
+      return resolveImageGenCached(logger).id;
+    },
+    get label() {
+      return resolveImageGenCached(logger).label;
+    },
+    isConfigured: () => resolveImageGenCached(logger).isConfigured(),
+    generate: (req) => resolveImageGenCached(logger).generate(req),
+  };
+}
+
 /** ===== 运行时会话 ===== */
 
 interface AgentSession {
@@ -366,11 +424,14 @@ async function persist(project: Project): Promise<string> {
 export async function startAgentRun(input: {
   requirement: string;
   sourceDirs: string[];
+  /** 角色设计图/主体参考图本地路径（可选）：分镜关键帧据此锁主体外貌 */
+  referenceImages?: string[];
 }): Promise<AgentSnapshot> {
   const controller = new AbortController();
   const options: AgentRunOptions = {
     requirement: input.requirement,
     sourceDirs: input.sourceDirs,
+    referenceImages: input.referenceImages,
     deps: createAgentDeps((msg) => broadcast({ type: 'log', message: msg })),
     autoResume: false,
     signal: controller.signal,

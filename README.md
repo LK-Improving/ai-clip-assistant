@@ -9,7 +9,7 @@
 | 桌面壳 | Electron 44 + Electron Forge 7 | 主进程 / 预加载 / 渲染进程三层隔离 |
 | 前端 | React 19 + Vite 7 + TailwindCSS 4 + shadcn/ui | 经典五区剪辑布局；属性面板变换/音量/转场全量真实接线（bridge 回写工程→filter_complex 消费，往返不漂移） |
 | 数据模型 | `@miaoma/video-project`（Zod 4） | 判别联合 + `schemaVersion` 迁移；Asset 含语义描述与 96 维特征向量（P2，optional 向后兼容） |
-| 智能体 | `@miaoma/agent`（**LangGraph.js** `@langchain/langgraph` StateGraph 编排，LLM 经 **LangChain.js** `@langchain/core` 模型抽象，另接 `@langchain/openai` / `@langchain/ollama`） | 10 节点流水线 + 原生 interrupt 人机中断 + Checkpoint 断点续传；match-assets 语义贪心匹配；**多模型引擎（火山方舟 / 本地 Ollama / 离线 / 自定义 OpenAI 兼容如 DeepSeek，设置中心可切）**（Function Calling + Zod + 自动重试）+ 离线/火山/本地/自定义 TTS 四路由（未内置模型权重）；视频生成 Seedance/MiniMax/自定义任务协议可选 |
+| 智能体 | `@miaoma/agent`（**LangGraph.js** `@langchain/langgraph` StateGraph 编排，LLM 经 **LangChain.js** `@langchain/core` 模型抽象，另接 `@langchain/openai` / `@langchain/ollama`） | 10 节点流水线 + 原生 interrupt 人机中断 + Checkpoint 断点续传；match-assets 语义贪心匹配；**多模型引擎（火山方舟 / 本地 Ollama / 离线 / 自定义 OpenAI 兼容如 DeepSeek，设置中心可切）**（Function Calling + Zod + 自动重试）；TTS 四类链路（火山 **v3 WebSocket 二进制分帧流式** / 本地 Index-TTS 2 **三协议自识别 + 探活诊断** / 自定义 `/audio/speech` / 离线静音），零样本克隆可走本地自托管或**绑定云端复刻 Speaker ID（无 GPU 可用）**，四级降级链每环原因可查；视频生成 Seedance/MiniMax/自定义任务协议可选 |
 | 渲染 | FFmpeg（阶段四已完成 + P1 效果消费） | 时间线 JSON → `filter_complex` → MP4；消费片段 `effects`（fade-in/fade-out 转场、eq/blackwhite/blur 滤镜白名单，未知效果降级告警）；失败/取消自动回滚半成品产物 |
 
 ## 目录结构
@@ -28,7 +28,7 @@ pnpm dev         # 构建 core 后启动桌面端（Forge + Vite 热更新）
 pnpm typecheck   # 全量类型检查
 pnpm build       # 构建 core + 桌面端产物
 pnpm make        # 打包安装包（模块 5.1 配置 maker 后可用）
-pnpm smoke       # 阶段五 5.2 P0+P1 全链路冒烟测试（无需 GUI，Node 端跑真实主进程逻辑）
+pnpm smoke       # 阶段五 5.2 P0+P1 全链路冒烟测试（无需 GUI，Node 端跑真实主进程逻辑；现共 40 环，含 TTS 协议 3 环）
 pnpm smoke:agent # 阶段二 AI 智能体引擎端到端冒烟测试（离线 Provider + 真实 ffmpeg 探测，验证流水线/中断 resume/checkpoint）
 pnpm bench:dist  # 打包体积基线（实测：win32-x64 便携包 477.7MB，含完整版 ffmpeg 98.1MB）
 pnpm vision:warmup # M4：预下载 CLIP 视觉模型到 .models/（需 Node ≥20.19；未下载时视觉检索自动降级词法向量，功能不损）
@@ -72,5 +72,7 @@ pnpm bench:metrics # M6：性能与效果实测基线（TTS 缓存/增量扫描/
 - [x] 阶段二续 M6：量化实测基线——`scripts/bench/metrics.*`（esbuild 打包真实主进程服务，Node 端可复跑）五组指标实测：增量重扫 20 文件 20ms vs 全量 21.4s（≈1068x）、TTS 命中 1ms vs 未命中 1.5s、200 坏样本经 Zod+重试+兜底后崩溃 0（对照裸 parse 崩 80/200）、checkpoint 崩溃恢复 275ms、110 片段工程存 21ms/读 40ms；报告 `docs/性能与效果实测.md`
 
 - [x] 自定义模型提供者（P-自定义）：三类模型均可接任意 OpenAI 兼容端点——LLM 加 `custom`（DeepSeek 等，ChatOpenAI 兼容 baseURL，支持 bindTools）；TTS 加 `custom`（POST {base}/audio/speech）；视频生成加 `seedance`（方舟任务协议）与 `custom`（OpenAI /videos 任务协议），统一 `HttpTaskVideoProvider` 建任→轮询→下载，未填模型 id 不猜测默认值；设置中心三区块均新增选项与字段；新冒烟环 mock 验证全链路，`pnpm smoke` 共 **35 环全绿**
+
+- [x] P0·TTS 真实协议落地（替代原 JSON 文本帧骨架）：**火山引擎 v3 WebSocket 双向流式二进制分帧协议**——`X-Api-App-Key/X-Api-Access-Key/X-Api-Resource-Id/X-Api-Connect-Id` 握手鉴权，StartConnection→StartSession→TaskRequest→FinishSession 会话时序，音频分片按序拼接（含 gzip inflate），错误码中文化（55000000 给 resource 路由指引、4001/3001 给鉴权指引），超时与 `AbortSignal` 取消；Resource ID 按 speaker 自动路由（`S_*`→seed-icl-2.0，`_uranus_/saturn_`→seed-tts-2.0，其余→seed-tts-1.0）。**本地 Index-TTS 2 三协议适配**：官方 Gradio REST（`/gradio_api/info`→`upload`→`call/{api}`→SSE→产物下载）、OpenAI 兼容壳（`/audio/speech`，自动补 `/v1`）、内置壳（`/tts`、`/tts/zero-shot`），`mode=auto` 探活定型并区分“连接层不可达”与“协议层不通”（只实现克隆接口的服务不会被误杀）。**零样本克隆双路径**：音色库可绑定**云端复刻 Speaker ID（S_xxxxx，无 GPU 环境拿真实克隆旁白）**，`clonePreference` 控制本地/云端优先，降级链 本地零样本→云端复刻→在线常规→离线静音且每环写 `ttsRouteTrace()`。新增 IPC `tts:probe`（握手探活，**不发起合成、不产生字符费用**）、`tts:route-trace`、`voice:set-speaker`；设置中心增「检测连通性」与协议模式/Resource ID/情感提示/克隆优先级配置；契约见 `.agents/Documents/接口设计/TTS火山v3与本地克隆接入契约.md`。新冒烟 3 环（v3 二进制帧拼接与鉴权头/会话时序/错误码/超时取消；三协议识别与宕机诊断；降级链顺序与原因），`pnpm smoke` 共 **40 环全绿**；真实凭证下的火山实链路与真实 Index-TTS 2 服务（需 NVIDIA GPU）仍待联调
 
 MVP 顺序：1.1 → 1.2 → 1.3 → 2.1/2.2（控制台跑通 AI）→ 3.1/4.1（FFmpeg 渲染验证）→ 3.2/4.2（界面串联）→ TTS 与细节优化。

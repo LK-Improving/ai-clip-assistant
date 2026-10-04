@@ -462,6 +462,78 @@ async function captureReferenceFrame(
   }
 }
 
+/** 按工程画布推分镜关键帧输出尺寸（宽*高，落在 qwen-image 允许区间） */
+function imageRatioSize(canvas?: { width: number; height: number }): string {
+  if (canvas && canvas.height > canvas.width) return '928*1664';
+  if (canvas && canvas.width === canvas.height) return '1328*1328';
+  return '1664*928';
+}
+
+/** 关键帧通用负向提示：压住多主体场景的高发畸变（肢体缺失/融合、手部变形） */
+const KEYFRAME_NEGATIVE = '肢体缺失，多余肢体，多余手指，手部畸形，面部扭曲，身体与背景融合，只有头部或局部身体，文字水印';
+
+/** ===== 节点：分镜关键帧（P4a，storyboard-image）：为待生成镜头逐镜出首帧图，供 generate-clips 走 I2V ===== */
+export async function storyboardImage(state: AgentState, deps: AgentDeps): Promise<NodeUpdate> {
+  const ig = deps.imageGen;
+  if (!ig || !ig.isConfigured()) {
+    deps.logger?.('[storyboard-image] 未配置图像模型，跳过分镜关键帧生成（generate-clips 将退回文生视频）');
+    return {};
+  }
+  const storyboard = state.storyboard;
+  if (!storyboard) return {};
+  const sceneAssets = state.matchResult?.sceneAssets ?? {};
+  const anchor = subjectAnchor(state);
+  const size = imageRatioSize(state.brief?.canvas);
+  // 角色设计图→data URI：取首张可读图作底图，逐镜走 edit 模式锁主体外貌；全部不可读则退回文生图
+  let baseImage: string | null = null;
+  for (const ref of state.referenceImages ?? []) {
+    baseImage = toImageDataUri(ref);
+    if (baseImage) break;
+    deps.logger?.(`[storyboard-image] 参考图不可读或超 4MB，跳过：${ref}`);
+  }
+  let made = 0;
+  const scenes: StoryboardScene[] = [];
+  for (const scene of storyboard.scenes) {
+    // 已匹配到真实素材的镜头不需要关键帧
+    if (sceneAssets[scene.order]) {
+      scenes.push(scene);
+      continue;
+    }
+    const sceneText = (scene.description || scene.title || '').trim();
+    if (!sceneText) {
+      scenes.push(scene);
+      continue;
+    }
+    // 构图完整性约束：多主体镜头防“只剩头和手”这类肢体裁切
+    const composition = '画面中每个角色都要以完整的半身或全身入镜，头、躯干、四肢结构完整自然，角色之间不融合、不缺肢、不变形';
+    const prompt = baseImage
+      ? `严格保持参考图中角色的长相、发型、发色与服装完全一致，不得改色或换人。${anchor ? `${anchor}。` : ''}据此角色与下列场景绘制分镜画面：${sceneText}。${composition}`.slice(0, 1200)
+      : [anchor, sceneText, composition].filter(Boolean).join('。').slice(0, 1200);
+    try {
+      let res;
+      if (baseImage) {
+        try {
+          res = await ig.generate({ mode: 'edit', prompt, baseImage, size, negativePrompt: KEYFRAME_NEGATIVE });
+        } catch (e) {
+          // edit 模型未开通/接口不兼容时逐镜退回文生图，不让整条关键帧链路断掉
+          deps.logger?.(`[storyboard-image] 参考图编辑模式失败，退回文生图：${(e as Error).message}`);
+          res = await ig.generate({ mode: 'text2image', prompt: [anchor, sceneText, composition].filter(Boolean).join('。').slice(0, 1200), size, negativePrompt: KEYFRAME_NEGATIVE });
+        }
+      } else {
+        res = await ig.generate({ mode: 'text2image', prompt, size, negativePrompt: KEYFRAME_NEGATIVE });
+      }
+      deps.signal?.throwIfAborted?.();
+      scenes.push({ ...scene, keyframePath: res.imagePath });
+      made += 1;
+    } catch (e) {
+      deps.logger?.(`[storyboard-image] 场景 ${scene.order} 关键帧失败，退回文生视频：${(e as Error).message}`);
+      scenes.push(scene);
+    }
+  }
+  deps.logger?.(`[storyboard-image] 已生成 ${made} 张分镜关键帧${baseImage ? '（基于角色设计图锁主体）' : ''}`);
+  return made ? { storyboard: { scenes } } : {};
+}
+
 export async function generateClips(state: AgentState, deps: AgentDeps): Promise<NodeUpdate> {
   const vg = deps.videoGen;
   if (!vg || !vg.isConfigured()) {
@@ -480,9 +552,12 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
 
   // 需要 AI 生成的镜头（没匹配到真实素材的）
   const pending = storyboard.scenes.filter((scene) => !sceneAssets[scene.order]);
+  // 任一待生成镜头带分镜关键帧 → 走逐镜 I2V（首帧驱动），不适用整段一镜到底
+  const hasKeyframe = pending.some((scene) => scene.keyframePath);
+  const canI2V = vg.supportsModes?.includes('i2v') ?? false;
 
   /* ===== 优先一镜到底：多个镜头合成一条 prompt 一次生成 ===== */
-  if (pending.length >= 2) {
+  if (pending.length >= 2 && !hasKeyframe) {
     const totalMs = pending.reduce((sum, scene) => sum + scene.durationMs, 0);
     const maxSec = vg.maxDurationSec ?? 0;
     if (maxSec > 0 && Math.ceil(totalMs / 1000) <= maxSec) {
@@ -545,12 +620,19 @@ export async function generateClips(state: AgentState, deps: AgentDeps): Promise
 
     attempted += 1;
     try {
+      // 有分镜关键帧且 Provider 支持 I2V → 首帧驱动图生视频；否则文生视频 + 跨段参考图锁主体
+      const firstFrame = scene.keyframePath ? toImageDataUri(scene.keyframePath) : null;
+      const useI2V = Boolean(firstFrame) && canI2V;
+      if (scene.keyframePath && !canI2V) {
+        deps.logger?.(`[gen-clips] 场景 ${scene.order} 有关键帧但当前 Provider 不支持 I2V，退回文生视频`);
+      }
       const res = await vg.generate({
         prompt,
         durationSec: scene.durationMs / 1000,
         ratio,
-        referenceImage: referenceImage ?? undefined,
+        ...(useI2V ? { mode: 'i2v' as const, firstFrame: firstFrame as string } : { referenceImage: referenceImage ?? undefined }),
       });
+      deps.logger?.(`[gen-clips] 场景 ${scene.order} ${useI2V ? 'I2V 首帧驱动' : '文生视频'}生成中…`);
       const asset = await buildGeneratedAsset(res, deps, `AI生成-${scene.order + 1}.${res.ext}`, scene.description || scene.title, ['ai-generated']);
       sceneAssets[scene.order] = asset.id;
       addedAssets.push(asset);
@@ -1001,6 +1083,7 @@ export const NODE_RUNNERS: Record<
   'storyboard-plan': storyboardNode,
   'storyboard-review': (state) => storyboardReview(state),
   'match-assets': matchAssets,
+  'storyboard-image': storyboardImage,
   'generate-clips': generateClips,
   'speech-synthesis': speechSynthesis,
   'assemble-timeline': assembleTimeline,

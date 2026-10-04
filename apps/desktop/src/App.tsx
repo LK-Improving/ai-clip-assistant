@@ -1,31 +1,25 @@
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import { AppShell } from '@/components/layout/app-shell';
-import AiWorkflowPage from '@/pages/ai-workflow';
+import ChatPage from '@/pages/chat';
 import EditorPage from '@/pages/editor';
 import ExportProgressPage from '@/pages/export-progress';
 import ExportSettingsPage from '@/pages/export-settings';
-import HomePage from '@/pages/home';
-import LaunchPage from '@/pages/launch';
 import LibraryPage from '@/pages/library';
 import NewProjectPage from '@/pages/new-project';
 import ProjectsPage from '@/pages/projects';
 import SettingsPage from '@/pages/settings';
-import StoryboardPage from '@/pages/storyboard';
 import TasksPage from '@/pages/tasks';
 import { bindTimelineToActiveProject } from '@/lib/timeline-store';
 
 /**
- * 极简 hash 路由：#/home、#/editor ...
- * 后续页面变重时可平滑替换为 react-router，路由表结构不变。
+ * 创作统一从 #/new 开始，#/chat 承接生成、分镜确认与后续对话。
+ * 旧启动页/工作台链接兼容跳转到同一个创作入口。
  */
-const routes: Record<string, { element: ReactNode; bare?: boolean }> = {
-  '/launch': { element: <LaunchPage />, bare: true },
-  '/home': { element: <HomePage /> },
+const routes: Record<string, { element: ReactNode }> = {
   '/projects': { element: <ProjectsPage /> },
   '/new': { element: <NewProjectPage /> },
-  '/ai': { element: <AiWorkflowPage /> },
-  '/storyboard': { element: <StoryboardPage /> },
+  '/chat': { element: <ChatPage /> },
   '/library': { element: <LibraryPage /> },
   '/editor': { element: <EditorPage /> },
   '/export': { element: <ExportSettingsPage /> },
@@ -34,8 +28,12 @@ const routes: Record<string, { element: ReactNode; bare?: boolean }> = {
   '/tasks': { element: <TasksPage /> },
 };
 
+/** 已废弃的旧路由 → 归一到整页 AI 助手对话页 */
+const LEGACY_DOCK_ROUTES = new Set(['/ai', '/storyboard']);
+const LEGACY_START_ROUTES = new Set(['/launch', '/home']);
+
 function currentRoute() {
-  return window.location.hash.replace(/^#/, '') || '/launch';
+  return window.location.hash.replace(/^#/, '') || '/new';
 }
 
 export default function App() {
@@ -47,14 +45,23 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
+  // 遗留的 #/ai、#/storyboard：归一到整页 AI 助手对话页
+  useEffect(() => {
+    if (LEGACY_START_ROUTES.has(route)) {
+      window.location.hash = '#/new';
+      return;
+    }
+    if (!LEGACY_DOCK_ROUTES.has(route)) return;
+    window.location.hash = '#/chat';
+  }, [route]);
+
   /**
    * 时间线 store 绑定激活工程：载入当前工程，并在打开/新建工程时重载。
    * 不绑的话会出现“切了工程但时间线还是上一个”。
    */
   useEffect(() => bindTimelineToActiveProject(), []);
 
-  const page = routes[route] ?? routes['/home']!;
+  const page = routes[route] ?? routes['/new']!;
 
-  if (page.bare) return page.element;
   return <AppShell route={route}>{page.element}</AppShell>;
 }

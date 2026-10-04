@@ -23,7 +23,9 @@ const ENTRY = `
 import { renderToString } from 'react-dom/server';
 import { createElement } from 'react';
 import { AppShell } from '@/components/layout/app-shell';
-export function render(route: string): string {
+import { setDockOpen } from '@/lib/dock-control';
+export function render(route: string, open: boolean): string {
+  setDockOpen(Boolean(open));
   return renderToString(createElement(AppShell, { route, children: createElement('div', null, 'x') }));
 }
 `;
@@ -56,16 +58,20 @@ try {
   console.log('== 渲染层冒烟（AppShell + AI 助手浮层 SSR 渲染）==');
 
   // 剪辑页：浮层默认收起，只应看到把手，不应出现输入框
-  const editorHtml = mod.render('/editor');
+  const editorHtml = mod.render('/editor', false);
   check('剪辑页渲染不崩溃', editorHtml.length > 1000, `length=${editorHtml.length}`);
-  check('剪辑页含左侧导航', editorHtml.includes('设置中心') && editorHtml.includes('剪辑'));
+  check(
+    '剪辑页含左侧导航',
+    editorHtml.includes('VideoFlow') && editorHtml.includes('剪辑') && editorHtml.includes('新建创作'),
+  );
   check('剪辑页浮层收起（无输入框）', !editorHtml.includes('Enter 发送'));
+  check('侧栏含 AI 助手入口', editorHtml.includes('AI 助手') && editorHtml.includes('新建创作'));
 
-  // AI 创作页：浮层自动展开，输入框就绪（SSR 不跑 effect，所以只校初始结构）
-  const aiHtml = mod.render('/ai');
-  check('AI 页渲染不崩溃', aiHtml.length > 1000, `length=${aiHtml.length}`);
-  check('AI 页浮层自动展开', aiHtml.includes('AI 助手') && aiHtml.includes('Enter 发送'));
-  check('AI 页输入框给出可用指令示例', aiHtml.includes('删掉音乐轨'));
+  // 剪辑页抽屉展开（仅剪辑页有抽屉）：输入框就绪
+  const dockHtml = mod.render('/editor', true);
+  check('浮层展开渲染不崩溃', dockHtml.length > 1000, `length=${dockHtml.length}`);
+  check('浮层展开含输入框', dockHtml.includes('AI 助手') && dockHtml.includes('Enter 发送'));
+  check('浮层输入框提示可粘贴附件', dockHtml.includes('粘贴图片') && dockHtml.includes('一句话成片'));
 } catch (error) {
   check('渲染层冒烟执行', false, (error && error.message) || String(error));
 } finally {

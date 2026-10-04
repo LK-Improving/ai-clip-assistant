@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { OfflineChatModel } from './llm';
 import { OfflineVideoGenProvider } from './video-gen';
+import { OfflineImageGenProvider } from './image-gen';
 import type { AgentDeps, AgentTtsProvider, AgentTtsRequest, AgentTtsResult, MediaProbe } from './types';
 
 /** ===== 离线 TTS Provider：生成合法的静音 WAV，保证无引擎也能端到端跑通 ===== */
@@ -79,6 +80,7 @@ export function createDefaultDeps(): AgentDeps {
     llm: new OfflineChatModel({}),
     tts: new OfflineTtsProvider(),
     videoGen: new OfflineVideoGenProvider(),
+    imageGen: new OfflineImageGenProvider(),
     probe: offlineProbe,
     workDir: path.join(os.tmpdir(), 'miaoma-agent'),
   };
@@ -91,6 +93,7 @@ export function resolveDeps(partial?: Partial<AgentDeps>): AgentDeps {
     llm: partial?.llm ?? base.llm,
     tts: partial?.tts ?? base.tts,
     videoGen: partial?.videoGen ?? base.videoGen,
+    imageGen: partial?.imageGen ?? base.imageGen,
     probe: partial?.probe ?? base.probe,
     workDir: partial?.workDir ?? base.workDir,
     logger: partial?.logger,

@@ -24,9 +24,12 @@
     "clsx": "^2.1.1",
     "isomorphic-git": "^1.42.2",
     "lucide-react": "^1.45.0",
+    "mammoth": "^1.13.0",
+    "pdf-parse": "^2.4.5",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "tailwind-merge": "^3.6.0"
+    "tailwind-merge": "^3.6.0",
+    "word-extractor": "^1.0.4"
   },
   "devDependencies": {
     "@electron-forge/cli": "^7.11.2",

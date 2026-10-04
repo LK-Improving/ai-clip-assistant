@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
-import { Check, FolderOpen, Loader2, X } from 'lucide-react';
+import { Check, FolderOpen, Loader2, Play, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { ProgressRing } from '@/components/ui/misc';
 import { clearPendingExport, getPendingExport } from '@/lib/export-request';
 import type { RenderProgress } from '../main/services/render';
+import { cn } from '@/lib/utils';
 
 type Status = 'running' | 'done' | 'cancelled' | 'error' | 'nobridge' | 'empty';
 
 const STAGES = ['准备渲染', '视频合成', '字幕烧录', '封装输出'];
 
+/** 09 正在导出视频（对照设计稿）：横向进度 + 阶段清单，覆盖成功/失败/取消/离线/空态出口 */
 export default function ExportProgressPage() {
   const pending = getPendingExport();
   const [status, setStatus] = useState<Status>('running');
@@ -63,7 +64,6 @@ export default function ExportProgressPage() {
         }
       })
       .finally(() => unsub());
-    // 仅在挂载时启动一次
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -76,50 +76,65 @@ export default function ExportProgressPage() {
     if (pending) window.electronAPI?.shell?.openPath(pending.dir);
   };
 
-  /**
-   * 离开进度页：必须同时清掉待导出请求并导航。
-   * 只 clearPendingExport() 会让本页停在 done 态不跳转，表现为「点完成没反应」。
-   */
+  /** 离开进度页：同时清掉待导出请求并导航，避免停在 done 态不跳转 */
   const backToEditor = () => {
     clearPendingExport();
     window.location.hash = '#/editor';
   };
 
-  /** 失败/取消后回到导出设置页重新发起（pending 未清，参数还在） */
   const retryExport = () => {
     window.location.hash = '#/export';
   };
 
   const stageState = (index: number): 'done' | 'running' | 'todo' => {
     if (status === 'done') return 'done';
-    const activeIndex =
-      phase === 'preparing' ? 0 : phase === 'rendering' ? 1 + (warnings.length ? 1 : 0) : 3;
+    const activeIndex = phase === 'preparing' ? 0 : phase === 'rendering' ? 1 + (warnings.length ? 1 : 0) : 3;
     if (index < activeIndex) return 'done';
     if (index === activeIndex && status === 'running') return 'running';
     return 'todo';
   };
 
-  const ringValue = status === 'done' ? 100 : Math.round(percent);
+  const value = status === 'done' ? 100 : Math.round(percent);
+  const title =
+    status === 'done' ? '导出完成' : status === 'cancelled' ? '已取消' : status === 'error' ? '导出失败' : '正在导出视频';
 
   return (
     <div className="flex items-start justify-center p-8">
-      <div className="w-full max-w-md rounded-2xl border bg-card/70 p-8 shadow-xl shadow-primary/5">
-        <div className="flex flex-col items-center">
-          <ProgressRing value={ringValue} size={148} strokeWidth={12}>
-            <span className="text-3xl font-bold">{ringValue}%</span>
-          </ProgressRing>
-          <h1 className="mt-5 text-base font-semibold">
-            {status === 'done' ? '渲染完成' : status === 'cancelled' ? '已取消' : status === 'error' ? '导出失败' : '正在渲染视频'}
-          </h1>
-          {(status === 'running' || status === 'done') && (
-            <p className="mt-1 font-mono text-xs text-muted-foreground">
-              {fps > 0 ? `${fps.toFixed(0)} fps` : ''} {speed > 0 ? `· ${speed.toFixed(1)}x` : ''}
+      <div className="w-full max-w-lg rounded-2xl border bg-card/70 p-6 shadow-2xl shadow-primary/10">
+        {/* 头部 */}
+        <div className="flex items-start gap-4">
+          <span className="bg-brand flex size-14 shrink-0 items-center justify-center rounded-2xl text-white shadow-lg shadow-primary/40">
+            <Play className="size-6 fill-white" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h1 className="text-base font-semibold">{title}</h1>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {status === 'done'
+                ? '成片已生成，可打开所在文件夹查看。'
+                : status === 'error' || status === 'cancelled'
+                  ? message || '导出未完成。'
+                  : 'AI 已完成视频生成，正在导出成片… 请稍候，不要关闭页面'}
             </p>
-          )}
-          {message && (
-            <p className="mt-2 max-w-full break-all text-center text-xs text-muted-foreground">{message}</p>
-          )}
+          </div>
         </div>
+
+        {/* 进度条 */}
+        {pending && status !== 'empty' && status !== 'nobridge' && (
+          <div className="mt-5">
+            <div className="h-2 overflow-hidden rounded-full bg-secondary">
+              <div
+                className={cn('h-full rounded-full transition-all duration-300', status === 'error' || status === 'cancelled' ? 'bg-destructive' : 'bg-brand')}
+                style={{ width: `${value}%` }}
+              />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+              <span className="font-mono">
+                {fps > 0 ? `${fps.toFixed(0)} fps` : ''} {speed > 0 ? `· ${speed.toFixed(1)}x` : ''}
+              </span>
+              <span className="font-mono text-foreground">{value}%</span>
+            </div>
+          </div>
+        )}
 
         {status === 'empty' && (
           <p className="mt-6 text-center text-sm text-muted-foreground">没有待导出的工程，请先在编辑器中发起导出。</p>
@@ -128,8 +143,9 @@ export default function ExportProgressPage() {
           <p className="mt-6 text-center text-sm text-amber-300">当前为浏览器预览模式，导出需在桌面端运行。</p>
         )}
 
+        {/* 阶段清单 */}
         {pending && status !== 'empty' && status !== 'nobridge' && (
-          <ul className="mt-7 space-y-3 rounded-xl border bg-background/60 p-4">
+          <ul className="mt-5 space-y-3 rounded-xl border bg-background/60 p-4">
             {STAGES.map((label, i) => {
               const s = stageState(i);
               return (
@@ -144,17 +160,22 @@ export default function ExportProgressPage() {
                     <span className="size-5 rounded-full border border-input" />
                   )}
                   <span className={s === 'todo' ? 'text-muted-foreground' : undefined}>{label}</span>
-                  {s === 'running' ? (
-                    <span className="ml-auto text-xs text-primary">进行中</span>
-                  ) : s === 'done' ? (
-                    <span className="ml-auto text-xs text-emerald-400">完成</span>
-                  ) : (
-                    <span className="ml-auto text-xs text-muted-foreground">等待</span>
-                  )}
+                  <span
+                    className={cn(
+                      'ml-auto text-xs',
+                      s === 'done' ? 'text-emerald-400' : s === 'running' ? 'text-primary' : 'text-muted-foreground',
+                    )}
+                  >
+                    {s === 'done' ? '完成' : s === 'running' ? '进行中' : '等待中'}
+                  </span>
                 </li>
               );
             })}
           </ul>
+        )}
+
+        {message && (status === 'done' || status === 'error') && (
+          <p className="mt-3 max-w-full break-all text-center text-xs text-muted-foreground">{message}</p>
         )}
 
         {warnings.length > 0 && (
@@ -165,6 +186,7 @@ export default function ExportProgressPage() {
           </div>
         )}
 
+        {/* 交互出口：每个状态都必须给出口 */}
         <div className="mt-6 flex justify-center gap-3">
           {status === 'running' && (
             <button
@@ -175,7 +197,7 @@ export default function ExportProgressPage() {
             </button>
           )}
           {status === 'done' && (
-            <Button className="gap-2 rounded-full" onClick={openFolder}>
+            <Button className="bg-brand gap-2 rounded-full hover:opacity-95" onClick={openFolder}>
               <FolderOpen className="size-4" /> 打开所在文件夹
             </Button>
           )}
@@ -189,11 +211,7 @@ export default function ExportProgressPage() {
               完成
             </Button>
           )}
-          {/* 失败/取消/空态/浏览器模式也得给个出口，否则只能卡在进度页 */}
-          {(status === 'error' ||
-            status === 'cancelled' ||
-            status === 'empty' ||
-            status === 'nobridge') && (
+          {(status === 'error' || status === 'cancelled' || status === 'empty' || status === 'nobridge') && (
             <Button variant="ghost" className="rounded-full" onClick={backToEditor}>
               返回编辑器
             </Button>

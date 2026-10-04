@@ -29,7 +29,7 @@ const createWindow = () => {
     minHeight: 700,
     show: false,
     backgroundColor: '#0b0b0f',
-    title: 'KK剪映',
+    title: '智剪 AI · VideoFlow',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

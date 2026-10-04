@@ -31,6 +31,8 @@ export interface ProjectSummary {
   clipCount: number;
   /** 时间线总时长（毫秒） */
   durationMs: number;
+  /** 封面来源素材的本地绝对路径（首个真实 video/image 素材），供列表生成首帧缩略图；无则回退占位 */
+  coverPath?: string;
 }
 
 export interface CreateProjectInput {
@@ -64,6 +66,16 @@ function durationOf(project: Project): number {
   return max;
 }
 
+/** 封面素材：优先首个真实视频，其次图片；mock:// 与远端 :// 路径不可用作封面 */
+function coverOf(project: Project): string | undefined {
+  const isReal = (p?: string) => Boolean(p) && !p!.includes('://');
+  const video = project.assets.find((a: Project['assets'][number]) => a.type === 'video' && isReal(a.path));
+  if (video?.path) return video.path;
+  const image = project.assets.find((a: Project['assets'][number]) => a.type === 'image' && isReal(a.path));
+  if (image?.path) return image.path;
+  return undefined;
+}
+
 function toSummary(project: Project): ProjectSummary {
   return {
     id: project.id,
@@ -76,6 +88,7 @@ function toSummary(project: Project): ProjectSummary {
     assetCount: project.assets.length,
     clipCount: project.tracks.reduce((sum, track) => sum + track.clips.length, 0),
     durationMs: durationOf(project),
+    coverPath: coverOf(project),
   };
 }
 

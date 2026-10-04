@@ -18,7 +18,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/misc';
-import type { LlmConfig, TtsConfig, VideoGenConfig, VoiceProfile } from '@/preload';
+import type { ImageGenConfig, LlmConfig, TtsConfig, TtsProbeReport, VideoGenConfig, VoiceProfile } from '@/preload';
 import { cn } from '@/lib/utils';
 
 /** 10 设置中心（AI 设置为真实配置，其余沿用原有展示） */
@@ -47,6 +47,33 @@ function ConfiguredHint({ ok: ready, text }: { ok: boolean; text: string }) {
     <div className={cn('flex items-center gap-1.5 text-xs', ready ? 'text-emerald-400' : 'text-muted-foreground')}>
       {ready ? <Check className="size-3.5" /> : <CircleAlert className="size-3.5" />}
       {text}
+    </div>
+  );
+}
+
+/** 连通性检测单行结论：不可用时把 hint 当成「下一步做什么」直接给出，不丢给用户一个错误码 */
+function ProbeRow({ label, ok, configured, message, hints = [], extra }: {
+  label: string;
+  ok: boolean;
+  configured: boolean;
+  message: string;
+  hints?: string[];
+  extra?: string;
+}) {
+  return (
+    <div className="space-y-0.5">
+      <div className="flex items-center gap-1.5">
+        {ok ? <Check className="size-3 shrink-0 text-emerald-400" /> : <CircleAlert className="size-3 shrink-0 text-muted-foreground" />}
+        <span className="font-medium">{label}</span>
+        <span className={cn('rounded px-1.5 text-[10px]', ok ? 'bg-emerald-500/15 text-emerald-400' : configured ? 'bg-amber-500/15 text-amber-400' : 'bg-secondary text-muted-foreground')}>
+          {ok ? '可用' : configured ? '不可用' : '未配置'}
+        </span>
+        {extra ? <span className="font-mono text-[10px] text-muted-foreground">{extra}</span> : null}
+      </div>
+      <p className="pl-4.5 text-[10px] leading-relaxed text-muted-foreground">{message}</p>
+      {hints.map((hint) => (
+        <p key={hint} className="pl-4.5 text-[10px] leading-relaxed text-muted-foreground">· {hint}</p>
+      ))}
     </div>
   );
 }
@@ -163,8 +190,8 @@ function VideoModelPicker({
 }
 
 /**
- * M3 自定义音色库（零样本克隆）：参考音频导入（带校验）/试听/删除。
- * 分镜页每场可选音色；本地 Index-TTS 2 服务不可用时自动降级常规音色（不阻断成片）。
+ * M3 自定义音色库（零样本克隆）：参考音频导入（带校验）/试听/删除/绑定云端复刻音色。
+ * 分镜页每场可选音色；本地 Index-TTS 2 不可用（无 GPU / 服务未起）时自动降级云端复刻→在线→静音。
  */
 function VoiceLibrarySection() {
   const [voices, setVoices] = useState<VoiceProfile[]>([]);
@@ -219,10 +246,24 @@ function VoiceLibrarySection() {
     await refresh();
   }
 
+  /** 绑定/解绑云端复刻 Speaker ID（S_xxxxx）：没有 NVIDIA 显卡时零样本克隆的真实可用路径 */
+  async function bindSpeaker(id: string, speaker: string) {
+    const api = window.electronAPI;
+    if (!api) return;
+    try {
+      const updated = await api.voice.setSpeaker(id, speaker.trim());
+      setMsg(speaker.trim() ? `音色「${updated.name}」已绑定云端复刻 ${updated.cloudSpeaker}` : `音色「${updated.name}」已解绑云端复刻`);
+      await refresh();
+    } catch (e) {
+      setMsg(`绑定失败：${(e as Error).message}`);
+      await refresh();
+    }
+  }
+
   return (
     <Section
       title="自定义音色（零样本克隆）"
-      desc="导入 3–20 秒清晰人声样本；分镜页为每场选择音色即用克隆旁白（需本地 Index-TTS 2 服务，不可用时自动降级常规音色）"
+      desc="导入 3–20 秒清晰人声样本；分镜页为每场选音色即用克隆旁白。优先走本地 Index-TTS 2（需自备 GPU 服务），不可用时自动降级云端复刻→在线音色→静音占位，不阻断成片"
     >
       {voices.length === 0 ? (
         <p className="text-xs text-muted-foreground">尚无自定义音色；导入一段参考音频即可开始克隆。</p>
@@ -243,6 +284,18 @@ function VoiceLibrarySection() {
               >
                 <Play className="size-3.5" />
               </button>
+              <input
+                defaultValue={v.cloudSpeaker ?? ''}
+                placeholder={v.cloudSpeaker ? '' : '云端复刻 S_xxx（可留空）'}
+                aria-label="云端复刻 Speaker ID"
+                className="h-7 w-40 shrink-0 rounded border border-input bg-transparent px-2 text-[11px]"
+                onBlur={(e) => {
+                  if (e.target.value.trim() !== (v.cloudSpeaker ?? '')) void bindSpeaker(v.id, e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                }}
+              />
               <button
                 onClick={() => void remove(v.id, v.name)}
                 className="rounded p-1 text-muted-foreground hover:text-destructive"
@@ -274,7 +327,11 @@ export default function SettingsPage() {
   const [tts, setTts] = useState<TtsConfig | null>(null);
   const [llm, setLlm] = useState<LlmConfig | null>(null);
   const [videoGen, setVideoGen] = useState<VideoGenConfig | null>(null);
+  const [imageGen, setImageGen] = useState<ImageGenConfig | null>(null);
   const [saved, setSaved] = useState('');
+  /** TTS 连通性检测结论（保存后立即重测可避免「改了配置但不知道能不能用」） */
+  const [ttsProbe, setTtsProbe] = useState<TtsProbeReport | null>(null);
+  const [probing, setProbing] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -295,6 +352,11 @@ export default function SettingsPage() {
       } catch {
         /* 同上 */
       }
+      try {
+        setImageGen(await api.imageGen.getConfig());
+      } catch {
+        /* 同上 */
+      }
     })();
   }, []);
 
@@ -303,6 +365,26 @@ export default function SettingsPage() {
     if (!api || !tts) return;
     setTts(await api.tts.setConfig(tts));
     setSaved('TTS 配置已保存');
+    setTtsProbe(null);
+  }
+
+  /** 先落盘再探活，保证测的是刚填的地址/协议；探活只读，不产生合成费用 */
+  async function runTtsProbe() {
+    const api = window.electronAPI;
+    if (!api || !tts) return;
+    setProbing(true);
+    try {
+      const next = await api.tts.setConfig(tts);
+      setTts(next);
+      const report = await api.tts.probe(true);
+      setTtsProbe(report);
+      setSaved('');
+    } catch (e) {
+      setTtsProbe(null);
+      setSaved(`连通性检测失败：${(e as Error).message}`);
+    } finally {
+      setProbing(false);
+    }
   }
 
   async function saveLlm() {
@@ -317,6 +399,13 @@ export default function SettingsPage() {
     if (!api || !videoGen) return;
     setVideoGen(await api.videoGen.setConfig(videoGen));
     setSaved('视频生成模型配置已保存');
+  }
+
+  async function saveImageGen() {
+    const api = window.electronAPI;
+    if (!api || !imageGen) return;
+    setImageGen(await api.imageGen.setConfig(imageGen));
+    setSaved('图像模型配置已保存');
   }
 
   const ttsReady = tts
@@ -343,6 +432,11 @@ export default function SettingsPage() {
         : videoGen.active === 'custom'
           ? Boolean(videoGen.custom.apiKey && videoGen.custom.baseUrl && videoGen.custom.model)
           : Boolean(videoGen.minimax.apiKey)
+    : false;
+  const imageGenReady = imageGen
+    ? imageGen.active === 'offline'
+      ? true
+      : Boolean(imageGen.qwen.apiKey)
     : false;
 
   return (
@@ -389,9 +483,22 @@ export default function SettingsPage() {
                       value={tts.active}
                       onChange={(e) => setTts({ ...tts, active: e.target.value as TtsConfig['active'] })}
                     >
-                      <option value="volcano">火山引擎</option>
-                      <option value="local">本地 Index-TTS 2</option>
+                      <option value="volcano">火山引擎（v3 WebSocket 流式）</option>
+                      <option value="local">本地 Index-TTS 2（自托管服务）</option>
                       <option value="custom">自定义（OpenAI 兼容 /audio/speech）</option>
+                    </select>
+                  </Field>
+
+                  <Field label="克隆优先级（选自定义音色时生效）">
+                    <select
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                      value={tts.clonePreference}
+                      onChange={(e) =>
+                        setTts({ ...tts, clonePreference: e.target.value as TtsConfig['clonePreference'] })
+                      }
+                    >
+                      <option value="local-first">本地优先（隐私最好，需自备 GPU 服务）</option>
+                      <option value="cloud-first">云端优先（无显卡环境推荐，走火山复刻音色）</option>
                     </select>
                   </Field>
 
@@ -405,7 +512,7 @@ export default function SettingsPage() {
                           }
                         />
                       </Field>
-                      <Field label="Access Token">
+                      <Field label="Access Token（访问控制 API Key）">
                         <Input
                           type="password"
                           value={tts.volcano.accessToken}
@@ -414,11 +521,30 @@ export default function SettingsPage() {
                           }
                         />
                       </Field>
-                      <Field label="音色">
+                      <Field label="音色 / Speaker ID（复刻音色填 S_xxxxx）">
                         <Input
                           value={tts.volcano.voice}
+                          placeholder="zh_female_vv_uranus_bigtts 或 S_EVeoGUVU1"
                           onChange={(e) =>
                             setTts({ ...tts, volcano: { ...tts.volcano, voice: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="Resource ID（留空按音色自动路由）">
+                        <Input
+                          value={tts.volcano.resourceId}
+                          placeholder="S_* → seed-icl-2.0；_uranus_ → seed-tts-2.0；其余 → seed-tts-1.0"
+                          onChange={(e) =>
+                            setTts({ ...tts, volcano: { ...tts.volcano, resourceId: e.target.value } })
+                          }
+                        />
+                      </Field>
+                      <Field label="情感提示（可选，自然语言描述）">
+                        <Input
+                          value={tts.volcano.emotion}
+                          placeholder="越具体越有效，如：声音很轻很慢，像在耳边说话"
+                          onChange={(e) =>
+                            setTts({ ...tts, volcano: { ...tts.volcano, emotion: e.target.value } })
                           }
                         />
                       </Field>
@@ -428,12 +554,37 @@ export default function SettingsPage() {
                       <Field label="服务地址">
                         <Input
                           value={tts.local.baseUrl}
-                          placeholder="http://127.0.0.1:7860"
+                          placeholder="官方 WebUI：http://127.0.0.1:7860；兼容壳看启动日志"
                           onChange={(e) =>
                             setTts({ ...tts, local: { ...tts.local, baseUrl: e.target.value } })
                           }
                         />
                       </Field>
+                      <Field label="协议模式">
+                        <select
+                          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                          value={tts.local.mode}
+                          onChange={(e) =>
+                            setTts({ ...tts, local: { ...tts.local, mode: e.target.value as TtsConfig['local']['mode'] } })
+                          }
+                        >
+                          <option value="auto">自动识别（探活后定型）</option>
+                          <option value="gradio">官方 Index-TTS 2 WebUI（Gradio REST）</option>
+                          <option value="openai">OpenAI 兼容壳（/audio/speech）</option>
+                          <option value="custom">内置壳（/tts 与 /tts/zero-shot）</option>
+                        </select>
+                      </Field>
+                      {tts.local.mode === 'gradio' ? (
+                        <Field label="Gradio 端点名（留空自动挑 tts/generate/synth）">
+                          <Input
+                            value={tts.local.gradioApiName}
+                            placeholder="如 tts / generate（需 --enable_api 启动）"
+                            onChange={(e) =>
+                              setTts({ ...tts, local: { ...tts.local, gradioApiName: e.target.value } })
+                            }
+                          />
+                        </Field>
+                      ) : null}
                       <Field label="音色">
                         <Input
                           value={tts.local.voice}
@@ -483,14 +634,45 @@ export default function SettingsPage() {
                     </>
                   )}
 
-                  <div className="flex items-center justify-between pt-1">
+                  {ttsProbe ? (
+                    <div className="space-y-2 rounded-lg border bg-background/40 p-2.5 text-[11px]">
+                      <ProbeRow
+                        label="火山引擎（v3 WebSocket 握手）"
+                        ok={ttsProbe.volcano.ok}
+                        configured={ttsProbe.volcano.configured}
+                        message={ttsProbe.volcano.message}
+                        extra={`${ttsProbe.volcano.latencyMs}ms`}
+                      />
+                      <ProbeRow
+                        label="本地 Index-TTS 2"
+                        ok={ttsProbe.local.ok}
+                        configured={ttsProbe.local.configured}
+                        message={ttsProbe.local.message}
+                        hints={ttsProbe.local.hints}
+                      />
+                      <ProbeRow
+                        label="自定义 TTS"
+                        ok={ttsProbe.custom.ok}
+                        configured={ttsProbe.custom.configured}
+                        message={ttsProbe.custom.message}
+                        hints={ttsProbe.custom.hints}
+                      />
+                    </div>
+                  ) : null}
+
+                  <div className="flex items-center justify-between gap-2 pt-1">
                     <ConfiguredHint
                       ok={ttsReady}
                       text={ttsReady ? '已配置，将使用真实语音合成' : '未配置，旁白将降级为静音占位'}
                     />
-                    <Button size="sm" className="rounded-full px-4" onClick={saveTts}>
-                      保存 TTS
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      <Button size="sm" variant="outline" className="rounded-full px-4" onClick={runTtsProbe} disabled={probing}>
+                        {probing ? '检测中…' : '检测连通性'}
+                      </Button>
+                      <Button size="sm" className="rounded-full px-4" onClick={saveTts}>
+                        保存 TTS
+                      </Button>
+                    </div>
                   </div>
                 </>
               ) : (
@@ -534,6 +716,13 @@ export default function SettingsPage() {
                           onChange={(e) => setLlm({ ...llm, ollama: { ...llm.ollama, model: e.target.value } })}
                         />
                       </Field>
+                      <Field label="视觉模型（可选，图片附件内容识别）">
+                        <Input
+                          value={llm.ollama.visionModel ?? ''}
+                          placeholder="如 qwen2.5-vl:7b，需先 ollama pull；留空则不识别图片内容"
+                          onChange={(e) => setLlm({ ...llm, ollama: { ...llm.ollama, visionModel: e.target.value } })}
+                        />
+                      </Field>
                     </>
                   ) : null}
 
@@ -559,6 +748,13 @@ export default function SettingsPage() {
                           value={llm.custom.model}
                           placeholder="以服务商控制台模型 id 为准，如 deepseek-chat"
                           onChange={(e) => setLlm({ ...llm, custom: { ...llm.custom, model: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="视觉模型（可选，图片附件内容识别）">
+                        <Input
+                          value={llm.custom.visionModel ?? ''}
+                          placeholder="同端点下支持图片输入的模型 id，如 qwen-vl-max；留空则不识别图片内容"
+                          onChange={(e) => setLlm({ ...llm, custom: { ...llm.custom, visionModel: e.target.value } })}
                         />
                       </Field>
                     </>
@@ -785,6 +981,86 @@ export default function SettingsPage() {
                     />
                     <Button size="sm" className="rounded-full px-4" onClick={saveVideoGen}>
                       保存视频模型
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">加载中…</p>
+              )}
+            </Section>
+
+            {/* 图像生成模型（分镜关键帧） */}
+            <Section title="图像模型（分镜关键帧）" desc="为分镜逐镜生成关键帧图，作为图生视频（I2V）的首帧（千问图像 qwen-image）">
+              {imageGen ? (
+                <>
+                  <Field label="Provider">
+                    <select
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                      value={imageGen.active}
+                      onChange={(e) =>
+                        setImageGen({ ...imageGen, active: e.target.value as ImageGenConfig['active'] })
+                      }
+                    >
+                      <option value="offline">离线（不生成关键帧，视频走文生视频）</option>
+                      <option value="qwen">千问图像（阿里云百炼 DashScope）</option>
+                    </select>
+                  </Field>
+
+                  {imageGen.active === 'qwen' ? (
+                    <>
+                      <Field label="API Key（DashScope）">
+                        <Input
+                          type="password"
+                          value={imageGen.qwen.apiKey}
+                          placeholder="sk-…，留空则不生成关键帧"
+                          onChange={(e) => setImageGen({ ...imageGen, qwen: { ...imageGen.qwen, apiKey: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="接入点">
+                        <Input
+                          value={imageGen.qwen.baseUrl}
+                          placeholder="https://dashscope.aliyuncs.com"
+                          onChange={(e) => setImageGen({ ...imageGen, qwen: { ...imageGen.qwen, baseUrl: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="文生图模型">
+                        <Input
+                          value={imageGen.qwen.textModel}
+                          placeholder="qwen-image-3.0-pro"
+                          onChange={(e) => setImageGen({ ...imageGen, qwen: { ...imageGen.qwen, textModel: e.target.value } })}
+                        />
+                      </Field>
+                      <Field label="图像编辑模型">
+                        <Input
+                          value={imageGen.qwen.editModel}
+                          placeholder="qwen-image-edit-max"
+                          onChange={(e) => setImageGen({ ...imageGen, qwen: { ...imageGen.qwen, editModel: e.target.value } })}
+                        />
+                      </Field>
+                      <p className="text-xs text-muted-foreground">
+                        启用后，分镜确认续跑时会自动为缺素材的镜头生成关键帧，并以首帧驱动 MiniMax H3 图生视频；
+                        未填 Key 时该步跳过，视频退回文生视频。北京/新加坡为独立 Key 与域名，不可跨区。
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      离线模式下不生成关键帧，generate-clips 将走文生视频 + 跨段参考图锁主体。
+                    </p>
+                  )}
+
+                  <div className="flex items-center justify-between pt-1">
+                    <ConfiguredHint
+                      ok={imageGenReady}
+                      text={
+                        imageGenReady
+                          ? imageGen.active === 'offline'
+                            ? '离线模式，不生成关键帧'
+                            : '已填写，分镜关键帧将启用千问图像'
+                          : '未填 API Key，不会生成关键帧'
+                      }
+                    />
+                    <Button size="sm" className="rounded-full px-4" onClick={saveImageGen}>
+                      保存图像模型
                     </Button>
                   </div>
                 </>

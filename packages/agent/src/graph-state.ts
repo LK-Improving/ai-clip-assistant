@@ -21,6 +21,7 @@ const overwrite = <T>(init: () => T) => ({
 export const AgentStateAnnotation = Annotation.Root({
   requirement: Annotation<string>(overwrite<string>(() => '')),
   sourceDirs: Annotation<string[]>(overwrite<string[]>(() => [])),
+  referenceImages: Annotation<string[] | undefined>(overwrite<string[] | undefined>(() => undefined)),
   scannedAssets: Annotation<Asset[]>(overwrite<Asset[]>(() => [])),
   brief: Annotation<Brief | null>(overwrite<Brief | null>(() => null)),
   storyboard: Annotation<Storyboard | null>(overwrite<Storyboard | null>(() => null)),
@@ -40,6 +41,7 @@ export function toAgentState(values: GraphStateType): AgentState {
   return {
     requirement: values.requirement,
     sourceDirs: values.sourceDirs,
+    referenceImages: values.referenceImages,
     scannedAssets: values.scannedAssets,
     brief: values.brief,
     storyboard: values.storyboard,

@@ -106,6 +106,7 @@ function buildGraph(deps: AgentDeps, options: AgentRunOptions, checkpointer: Bas
         : wrap('storyboard-review', NODE_RUNNERS['storyboard-review']),
     )
     .addNode('match-assets', wrap('match-assets', NODE_RUNNERS['match-assets']))
+    .addNode('storyboard-image', wrap('storyboard-image', NODE_RUNNERS['storyboard-image']))
     .addNode('generate-clips', wrap('generate-clips', NODE_RUNNERS['generate-clips']))
     .addNode('speech-synthesis', wrap('speech-synthesis', NODE_RUNNERS['speech-synthesis']))
     .addNode('assemble-timeline', wrap('assemble-timeline', NODE_RUNNERS['assemble-timeline']))
@@ -115,9 +116,11 @@ function buildGraph(deps: AgentDeps, options: AgentRunOptions, checkpointer: Bas
   graph.addEdge(START, 'scan-assets');
   graph.addEdge('scan-assets', 'creative-brief');
   graph.addEdge('creative-brief', 'storyboard-plan');
-  graph.addEdge('storyboard-plan', 'storyboard-review');
-  graph.addEdge('storyboard-review', 'match-assets');
-  graph.addEdge('match-assets', 'generate-clips');
+  // 先匹配素材、再为待生成镜头出关键帧，然后才进分镜确认（让人在确认界面就看到图）
+  graph.addEdge('storyboard-plan', 'match-assets');
+  graph.addEdge('match-assets', 'storyboard-image');
+  graph.addEdge('storyboard-image', 'storyboard-review');
+  graph.addEdge('storyboard-review', 'generate-clips');
   graph.addEdge('generate-clips', 'speech-synthesis');
   graph.addEdge('speech-synthesis', 'assemble-timeline');
   graph.addEdge('assemble-timeline', 'validate');
@@ -191,6 +194,8 @@ export async function runPipeline(options: AgentRunOptions): Promise<AgentRunRes
     requirement: options.requirement,
     sourceDirs: options.sourceDirs ?? [],
   };
+  // 角色设计图/主体参考图：storyboard-image 据此走 edit 模式锁主体（断点续跑时随 checkpoint 保留）
+  if (options.referenceImages?.length) input.referenceImages = options.referenceImages;
   // 二次编辑场景：沿用已有工程的素材库作为扫描起点
   if (options.project) input.scannedAssets = [...options.project.assets];
 

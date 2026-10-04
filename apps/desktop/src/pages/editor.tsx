@@ -12,14 +12,17 @@ import {
   useTimelineSelection,
   useTimelineTracks,
 } from '@/hooks/use-timeline';
-import { nextFreeStart, onSeekRequest, reportPlayhead, undoTimeline } from '@/lib/timeline-store';
+import { getTracks, nextFreeStart, onSeekRequest, reportPlayhead, undoTimeline } from '@/lib/timeline-store';
 import {
   formatTimecode,
+  createId,
+  taskForTrack,
   timelineTotalMs,
   type TimelineClip,
   type TimelineTrack,
 } from '@/lib/timeline-utils';
 import { getActiveProject } from '@/lib/active-project';
+import { requestOpenDock } from '@/lib/dock-control';
 import type { AssetMetaHint } from '@/lib/project-bridge';
 import { cn } from '@/lib/utils';
 
@@ -223,6 +226,25 @@ export default function EditorPage() {
     [applyActions],
   );
 
+  const handleAddMusic = useCallback((asset: LibraryAsset) => {
+    if (asset.kind !== 'audio') return;
+    const currentTracks = getTracks();
+    let track = currentTracks.find((item) => taskForTrack(item) === 'music');
+    const needsTrack = !track;
+    if (!track) {
+      track = { id: createId('track'), kind: 'audio', name: '音乐', clips: [] };
+    }
+    const clipId = createId('clip');
+    applyActions([
+      ...(needsTrack ? [{ type: 'replaceTracks' as const, tracks: [...currentTracks, track] }] : []),
+      { type: 'addClip', trackId: track.id, clip: {
+      id: clipId, name: asset.name, kind: 'audio', start: nextFreeStart(track),
+      duration: asset.durationMs || 5000, offset: 0, hue: 170, volume: 0.25,
+      assetPath: asset.path.startsWith('mock://') ? undefined : asset.path,
+    } }]);
+    setSelected({ trackId: track.id, clipId });
+  }, [applyActions, setSelected]);
+
   // Delete 键删除选中片段；Ctrl/Cmd+Z 撤销上一次时间线改动（含 AI 助手批量改）
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -253,7 +275,12 @@ export default function EditorPage() {
     setTtsMessage(null);
     try {
       const result = await api.tts.synthesize({ text: ttsText });
-      const audioTrack = tracks.find((t) => t.kind === 'audio');
+      const currentTracks = getTracks();
+      let audioTrack = currentTracks.find((t) => taskForTrack(t) === 'voice');
+      if (!audioTrack) {
+        audioTrack = { id: createId('track'), kind: 'audio', name: '旁白', clips: [] };
+        applyActions([{ type: 'replaceTracks', tracks: [...currentTracks, audioTrack] }]);
+      }
       if (audioTrack) {
         addClipToTrack(audioTrack.id, {
           name: `配音_${ttsText.slice(0, 8)}`,
@@ -273,7 +300,7 @@ export default function EditorPage() {
     } finally {
       setTtsBusy(false);
     }
-  }, [ttsText, tracks, addClipToTrack]);
+  }, [ttsText, applyActions, addClipToTrack]);
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -304,12 +331,12 @@ export default function EditorPage() {
           >
             <Import className="size-3.5" /> 导入素材
           </button>
-          <a
-            href="#/ai"
+          <button
+            onClick={requestOpenDock}
             className="flex h-7 items-center gap-1 rounded-md border border-input px-2.5 text-xs hover:text-foreground"
           >
-            <Sparkles className="size-3.5" /> AI 一键成片
-          </a>
+            <Sparkles className="size-3.5" /> AI 助手
+          </button>
           <a
             href="#/export"
             className="bg-brand inline-flex h-7 items-center gap-1.5 rounded-md px-3 text-xs font-medium text-white shadow shadow-primary/30"
@@ -345,6 +372,12 @@ export default function EditorPage() {
         <PropertyPanel
           clip={selectedClip}
           trackKind={selected ? (tracks.find((t) => t.id === selected.trackId)?.kind ?? null) : null}
+          tracks={tracks}
+          selectedTrackId={selected?.trackId ?? null}
+          onSelectClip={(trackId, clipId) => setSelected({ trackId, clipId })}
+          musicAssets={assets.filter((asset) => asset.kind === 'audio' && !asset.error)}
+          onAddMusic={handleAddMusic}
+          onImportMusic={() => void library.importFiles()}
           onClipChange={(patch) => {
             if (selected) handleClipChange(selected.trackId, selected.clipId, patch);
           }}

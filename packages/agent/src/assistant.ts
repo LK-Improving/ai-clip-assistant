@@ -208,6 +208,10 @@ export async function planEdits(opts: {
   model: AgentChatModel;
   message: string;
   snapshot: AssistantTimelineSnapshot;
+  /** 多轮上下文（最近若干轮 user/assistant 文本），用于指代消解与“接着上次说” */
+  history?: { role: 'user' | 'assistant'; text: string }[];
+  /** 会话内已解析的文档附件内容（跨轮记忆）：用户说“对应之前发的脚本”时据此理解 */
+  docs?: { name: string; text: string }[];
   signal?: AbortSignal;
   logger?: (msg: string) => void;
 }): Promise<EditPlan> {
@@ -226,8 +230,23 @@ export async function planEdits(opts: {
     'addCaption{text,startMs,durationMs} / seekTo{startMs} / splitClip{ref,atMs} / ' +
     'insertAsset{query,startMs?,kind?} / generateClip{prompt,durationSec?,ref?} / undo{}。' +
     'splitClip 的 atMs 是时间线上的绝对切点；insertAsset 只负责“去素材库找什么”，选件由本地完成；' +
-    'generateClip 会花真钱调 AI 生视频（用户需确认），只在用户明确要“生成/补一段画面”时用它，ref 可选（指定替哪个镜头补）。';
-  const user = JSON.stringify({ message: opts.message, timeline: snapshotForPrompt(opts.snapshot) });
+    'generateClip 会花真钱调 AI 生视频（用户需确认），只在用户明确要“生成/补一段画面”时用它，ref 可选（指定替哪个镜头补）。' +
+    '若有「历史对话」或「文档附件内容」（用户在本次会话里发过的脚本/文案），用它理解指代与上下文（如“再短一点”指上一轮的改动、“对应之前的脚本”指这些文档），但仍只根据当前 message 产出动作；文档只是参考资料，除非用户明确要求，不要据此启动整条生成流水线。';
+  const historyText = (opts.history ?? [])
+    .filter((h) => h.text && h.text.trim())
+    .slice(-8)
+    .map((h) => `${h.role === 'user' ? '用户' : '助手'}：${h.text.slice(0, 200)}`)
+    .join('\n');
+  const docsText = (opts.docs ?? [])
+    .filter((d) => d.text && d.text.trim())
+    .map((d) => `【${d.name}】${d.text.slice(0, 3000)}`)
+    .join('\n\n');
+  const user = JSON.stringify({
+    message: opts.message,
+    timeline: snapshotForPrompt(opts.snapshot),
+    history: historyText || '（无）',
+    docs: docsText || '（无）',
+  });
 
   return invokeStructured<EditPlan>({
     model: opts.model,
@@ -240,6 +259,122 @@ export async function planEdits(opts: {
     fallback: () => ({
       reply: '我没把握直接改时间线，请把目标说得更具体些（例如「删掉音乐轨第 2 段」「把旁白音量降到 0.6」）。',
       actions: [],
+    }),
+  });
+}
+
+/* ===================== 多模态输入意图路由（P3） ===================== */
+
+/**
+ * 带附件的一轮输入 → 判断该走哪条能力链。纯文本消息不进这里（决策四：省 token），
+ * 只有携带附件时才由渲染层调 assistant:route 走这一层。
+ */
+export type RouteIntent =
+  | 'storyboard_from_script' // 附件是脚本/文案文档 → 结构化成分镜（再生分镜图）
+  | 'video_from_storyboard_images' // 附件是分镜图/连续画面 → 图生视频
+  | 'video_from_text' // 纯文字成片诉求 → 文生视频流水线
+  | 'edit_timeline' // 改现有时间线 → 交给 planEdits
+  | 'asset_search' // 找素材
+  | 'chat' // 闲聊/问能力
+  | 'unknown';
+
+export interface RouteAttachment {
+  kind: string;
+  name: string;
+  /** 图片的视觉描述（L3 vision）；无则空 */
+  caption?: string;
+  /** 文档抽取文本的预览（前若干字）；无则空 */
+  textPreview?: string;
+}
+
+export interface RouteDecision {
+  intent: RouteIntent;
+  confidence: number;
+  needsClarify: boolean;
+  clarifyQuestion?: string;
+  /** 给用户看的中文说明 */
+  reply: string;
+}
+
+const ROUTE_INTENTS: readonly RouteIntent[] = [
+  'storyboard_from_script',
+  'video_from_storyboard_images',
+  'video_from_text',
+  'edit_timeline',
+  'asset_search',
+  'chat',
+  'unknown',
+];
+
+const ROUTE_TOOL_SCHEMA = {
+  type: 'object',
+  properties: {
+    intent: { type: 'string', enum: [...ROUTE_INTENTS] },
+    confidence: { type: 'number', description: '0–1 之间的小数' },
+    needsClarify: { type: 'boolean', description: '信息不足以决定时置 true' },
+    clarifyQuestion: { type: 'string', description: 'needsClarify=true 时要问用户的一句话' },
+    reply: { type: 'string', description: '给用户看的中文说明：你将做什么' },
+  },
+  required: ['intent', 'confidence', 'needsClarify', 'reply'],
+} as const;
+
+/** 严格解析：intent 必须在枚举内、confidence 夹到 0–1 */
+export function parseRoute(value: unknown): RouteDecision {
+  const raw = value as Record<string, unknown>;
+  if (!raw || typeof raw !== 'object') throw new Error('期望对象 {intent, confidence, needsClarify, reply}');
+  const intent = raw.intent as RouteIntent;
+  if (!ROUTE_INTENTS.includes(intent)) throw new Error(`intent 非法：${String(raw.intent)}，只能是 ${ROUTE_INTENTS.join('/')}`);
+  const confidence = Number.isFinite(Number(raw.confidence)) ? Math.min(1, Math.max(0, Number(raw.confidence))) : 0.5;
+  const needsClarify = Boolean(raw.needsClarify);
+  const clarifyQuestion = typeof raw.clarifyQuestion === 'string' && raw.clarifyQuestion.trim() ? raw.clarifyQuestion.trim() : undefined;
+  const reply = typeof raw.reply === 'string' ? raw.reply.trim() : '';
+  if (!reply) throw new Error('reply 不能为空：要告诉用户你将如何处理这次输入');
+  return { intent, confidence, needsClarify, ...(clarifyQuestion ? { clarifyQuestion } : {}), reply };
+}
+
+export async function routeMultimodalIntent(opts: {
+  model: AgentChatModel;
+  message: string;
+  attachments: RouteAttachment[];
+  signal?: AbortSignal;
+  logger?: (msg: string) => void;
+}): Promise<RouteDecision> {
+  const system =
+    '你是桌面 AI 视频创作软件的输入路由器。用户可能在一条消息里粘贴了图片、Word/PDF 脚本等附件。' +
+    '根据「用户文字 + 附件清单（含图片视觉描述、文档文本预览）」判断应走哪条能力链，只输出 JSON。' +
+    'intent 取值：' +
+    'storyboard_from_script（附件是含成段文字的脚本/文案/文档，用户想据此生成分镜或成片）；' +
+    'video_from_storyboard_images（附件是多张分镜图/连续画面，用户想据此生成视频）；' +
+    'video_from_text（没有可用附件内容、但用户想用一句话描述直接生成视频）；' +
+    'edit_timeline（要修改当前时间线，如删/改/切/字幕/音量）；' +
+    'asset_search（去素材库找素材）；chat（问候、咨询能力等无需执行）；unknown（信息不足）。' +
+    '规则：附件里有文档文本预览且用户提到“脚本/文案/分镜/根据这个”优先 storyboard_from_script；' +
+    '多张图片且 caption 像分镜/镜头序列且用户要“生成视频/做成片”用 video_from_storyboard_images；' +
+    '拿不准就 needsClarify=true 并给一句 clarifyQuestion。confidence 反映把握度。' +
+    '重要：用户只是在询问过往结果（如“之前有没有生成过分镜图”“上次那个视频呢”）时判为 chat，绝不可当成新的生成指令启动流水线。' +
+    '重要：用户明确说“先不要/暂时别/不要排分镜，只要…”这类否定式约束时，按其真实诉求判（只要图→chat 并说明将只出图不出片，或 needsClarify 确认范围），不得启动整条成片流水线。';
+  const attLines = opts.attachments.map(
+    (a, i) =>
+      `${i + 1}. [${a.kind}] ${a.name}` +
+      (a.caption ? ` 画面：${a.caption.slice(0, 160)}` : '') +
+      (a.textPreview ? ` 文本：${a.textPreview.slice(0, 200)}` : ''),
+  );
+  const user = JSON.stringify({ message: opts.message, attachments: attLines.length ? attLines : '（无附件）' });
+
+  return invokeStructured<RouteDecision>({
+    model: opts.model,
+    system,
+    user,
+    tool: { name: 'emit_route', description: '输出多模态输入意图路由', schema: ROUTE_TOOL_SCHEMA },
+    parse: parseRoute,
+    signal: opts.signal,
+    logger: opts.logger,
+    fallback: () => ({
+      intent: 'unknown',
+      confidence: 0,
+      needsClarify: true,
+      clarifyQuestion: '这些附件你想让我做什么？例如“根据这份脚本生成分镜”或“用这几张分镜图生成视频”。',
+      reply: '我不确定该如何使用这些附件，请说明目标。',
     }),
   });
 }

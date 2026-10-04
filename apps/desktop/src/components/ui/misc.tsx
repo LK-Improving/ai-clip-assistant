@@ -1,4 +1,5 @@
 import type * as React from 'react';
+import { useEffect, useState } from 'react';
 import { cn } from '@/lib/utils';
 
 interface ProgressRingProps {
@@ -110,4 +111,58 @@ function ThumbPlaceholder({
   );
 }
 
-export { Badge, ProgressRing, Switch, ThumbPlaceholder };
+export { Badge, ProgressRing, Switch, ThumbPlaceholder, ProjectCover };
+
+/**
+ * 项目封面：优先用首个视频/图片素材的首帧缩略图（按需经主进程生成），
+ * 无封面来源、浏览器预览模式或生成失败时回退到 ThumbPlaceholder 渐变占位。
+ */
+function ProjectCover({
+  coverPath,
+  hue,
+  label,
+  className,
+}: {
+  coverPath?: string;
+  hue: number;
+  label?: string;
+  className?: string;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const api = typeof window === 'undefined' ? undefined : window.electronAPI;
+    setFailed(false);
+    if (!coverPath || !api?.media?.thumbnail) {
+      setUrl(null);
+      return;
+    }
+    setUrl(null);
+    api.media
+      .thumbnail(coverPath, 0)
+      .then((p) => {
+        if (alive && p) setUrl(api.toMediaUrl(p));
+      })
+      .catch(() => {
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [coverPath]);
+
+  if (url && !failed) {
+    return (
+      <img
+        src={url}
+        alt=""
+        loading="lazy"
+        onError={() => setFailed(true)}
+        className={cn('h-full w-full object-cover', className)}
+      />
+    );
+  }
+  return <ThumbPlaceholder hue={hue} label={label} className={className} />;
+}

@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 
 import { getLibraryStore, LibraryStore } from '../../src/main/services/library';
 import { addAllowedPath, explainAccess, registerProtocols } from '../../src/main/protocol';
@@ -35,6 +36,10 @@ import { projectToTimeline } from '../../src/lib/project-bridge';
 import { generateThumbnail } from '../../src/main/services/thumbnail';
 import { ensurePlayable } from '../../src/main/services/preview';
 import { saveTtsConfig, loadTtsConfig } from '../../src/main/services/tts/config';
+import { setVolcanoWebSocketFactory, runVolcanoSession } from '../../src/main/services/tts/providers/volcano';
+import type { WebSocketLike } from '../../src/main/services/tts/providers/volcano';
+import { resetLocalProbeCache } from '../../src/main/services/tts/providers/local';
+import { VolcanoEvent, decodeFrame } from '../../src/main/services/tts/providers/volcano-protocol';
 import {
   renderProject,
   buildRenderPlan,
@@ -44,8 +49,8 @@ import {
   probeFreeBytes,
   precheckDiskSpace,
 } from '../../src/main/services/render';
-import { synthesizeSpeech, zeroShotFallbackReason } from '../../src/main/services/tts';
-import { addVoice, listVoices, removeVoice } from '../../src/main/services/voice';
+import { synthesizeSpeech, ttsProbe, ttsRouteTrace, zeroShotFallbackReason } from '../../src/main/services/tts';
+import { addVoice, listVoices, removeVoice, setVoiceSpeaker } from '../../src/main/services/voice';
 import {
   diffProjects,
   history,
@@ -849,45 +854,10 @@ async function ringLibraryScanVsImport(results: RingResult[]): Promise<void> {
 async function ringTtsVolcanoAuth(results: RingResult[]): Promise<void> {
   try {
     const handlers: Record<string, (...a: any[]) => any> = (globalThis as any).__MIAOMA_IPC__;
+
     if (!handlers['tts:synthesize']) throw new Error('tts:synthesize 处理器未注册');
 
     // 伪造 WebSocket：让火山 provider 走我们可控的「服务端响应」，无需真实联调
-    const origWs = (globalThis as any).WebSocket;
-    class FakeWsError {
-      binaryType = 'arraybuffer';
-      onopen: ((e: unknown) => void) | null = null;
-      onmessage: ((e: { data: unknown }) => void) | null = null;
-      onerror: ((e: unknown) => void) | null = null;
-      onclose: ((e: unknown) => void) | null = null;
-      constructor(_url: string) {
-        // 先 onopen，再下发一条「鉴权失败」的错误事件（code 分支）
-        setTimeout(() => {
-          this.onopen && this.onopen({});
-          setTimeout(() => {
-            this.onmessage &&
-              this.onmessage({
-                data: JSON.stringify({ event: 'error', code: 4001, message: 'invalid access token' }),
-              });
-          }, 0);
-        }, 0);
-      }
-      send(_d: string | ArrayBufferView | ArrayBuffer): void {}
-      close(): void {}
-    }
-    class FakeWsConnFail {
-      binaryType = 'arraybuffer';
-      onopen: ((e: unknown) => void) | null = null;
-      onmessage: ((e: { data: unknown }) => void) | null = null;
-      onerror: ((e: unknown) => void) | null = null;
-      onclose: ((e: unknown) => void) | null = null;
-      constructor(_url: string) {
-        setTimeout(() => {
-          this.onerror && this.onerror({});
-        }, 0);
-      }
-      send(_d: string | ArrayBufferView | ArrayBuffer): void {}
-      close(): void {}
-    }
 
     // (a) 未配置：appId/accessToken 缺失 → 明确提示而非静默失败
     saveTtsConfig({
@@ -906,38 +876,55 @@ async function ringTtsVolcanoAuth(results: RingResult[]): Promise<void> {
       throw new Error(`未配置分支提示不符预期：${unconfiguredMsg}`);
     }
 
-    // (b) 已配置但服务端返回错误码 → 抛出「火山引擎 TTS 返回错误 <code>: <msg>」
+    // (b) 已配置但服务端下行错误帧（v3 二进制 SESSION_FAILED）→ 抛出「火山引擎 TTS 返回错误 <code>: <中文释义>」
     saveTtsConfig({
       active: 'volcano',
       volcano: { appId: 'fake-app', accessToken: 'fake-token', voice: 'zh_female_roumei' },
       local: { baseUrl: 'http://127.0.0.1:1/tts', voice: 'default' },
       custom: { baseUrl: '', model: 'tts-1', voice: 'default', apiKey: '' },
     });
-    (globalThis as any).WebSocket = FakeWsError;
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(() => [
+      // 下行鉴权失败帧（CONNECTION_FAILED + code 4001）
+      () => serverFrame(VolcanoEvent.CONNECTION_FAILED, undefined, Buffer.from(JSON.stringify({ code: 4001, message: 'invalid access token' }))),
+    ]));
     let codeMsg = '';
     try {
       await handlers['tts:synthesize'](null, { text: `鉴权失败-${Date.now()}`, provider: 'volcano' });
     } catch (e) {
       codeMsg = (e as Error).message;
     } finally {
-      (globalThis as any).WebSocket = origWs;
+      setVolcanoWebSocketFactory(null);
     }
     if (!/火山引擎 TTS 返回错误 4001/.test(codeMsg)) {
       throw new Error(`错误码分支未触发：${codeMsg}`);
     }
-
-    // (c) 已配置但连接失败（onerror）→ 提示检查 appId/accessToken 与网络
-    (globalThis as any).WebSocket = FakeWsConnFail;
+    
+    // (c) 已配置但建连失败（onerror）→ 提示检查凭证与网络
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(() => [], { errorOnOpen: true }));
     let connMsg = '';
     try {
       await handlers['tts:synthesize'](null, { text: `连接失败-${Date.now()}`, provider: 'volcano' });
     } catch (e) {
       connMsg = (e as Error).message;
     } finally {
-      (globalThis as any).WebSocket = origWs;
+      setVolcanoWebSocketFactory(null);
     }
     if (!/火山引擎 TTS 连接失败/.test(connMsg)) {
       throw new Error(`连接失败分支未触发：${connMsg}`);
+    }
+    
+    // (d) 服务可达但全程不下行音频（close 时无字节）→ 提示「未收到音频」而非静默成功
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(() => [], { closeOnOpen: true }));
+    let silentMsg = '';
+    try {
+      await handlers['tts:synthesize'](null, { text: `无音频-${Date.now()}`, provider: 'volcano' });
+    } catch (e) {
+      silentMsg = (e as Error).message;
+    } finally {
+      setVolcanoWebSocketFactory(null);
+    }
+    if (!/未收到音频/.test(silentMsg)) {
+      throw new Error(`无音频分支未触发：${silentMsg}`);
     }
 
     results.push(ok('更细异常·火山鉴权', '未配置/错误码4001/连接失败 三分支均优雅报错'));
@@ -2088,10 +2075,10 @@ async function ringVoiceCloneM3(results: RingResult[]): Promise<void> {
     });
 
     const first = await synthesizeSpeech({ text: '零样本第一条旁白', voiceId: profile.id });
-    if (first.provider !== 'zero-shot') throw new Error(`指定音色应走零样本链，实际 provider=${first.provider}`);
+    if (first.provider !== 'zero-shot:local') throw new Error(`指定音色应走本地零样本链，实际 provider=${first.provider}`);
     if (!fs.existsSync(first.audioPath)) throw new Error('零样本产物未落盘');
     const second = await synthesizeSpeech({ text: '零样本第一条旁白', voiceId: profile.id });
-    if (!second.cached || second.provider !== 'zero-shot') throw new Error('同文本同音色应命中磁盘缓存');
+    if (!second.cached || second.provider !== 'zero-shot:local') throw new Error('同文本同音色应命中磁盘缓存');
 
     // 降级链：服务宕机 → 零样本失败 → 常规链（volcano 未配置）抛友好错误 + 可观察原因
     await new Promise<void>((resolve) => server!.close(() => resolve()));
@@ -2103,7 +2090,7 @@ async function ringVoiceCloneM3(results: RingResult[]): Promise<void> {
       fellBackMsg = (e as Error).message;
     }
     if (!fellBackMsg.includes('火山引擎 TTS')) throw new Error(`宕机后应降级常规链并报错，实际：${fellBackMsg || '未报错'}`);
-    if (!(zeroShotFallbackReason(profile.id) ?? '').includes('零样本合成失败')) {
+    if (!(zeroShotFallbackReason(profile.id) ?? '').includes('零样本')) {
       throw new Error(`降级原因应可观察（zeroShotFallbackReason），实际：${zeroShotFallbackReason(profile.id)}`);
     }
 
@@ -2122,6 +2109,420 @@ async function ringVoiceCloneM3(results: RingResult[]): Promise<void> {
   } finally {
     if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
     saveTtsConfig(originalTts);
+    for (const v of listVoices()) removeVoice(v.id);
+  }
+}
+
+// ============================================================================
+// P0：火山 v3 二进制协议与本地多协议「假服务」（独立实现，不依赖真实凭证 / GPU）
+// ============================================================================
+
+let lastVolcanoHeaders: Record<string, string> = {};
+let lastVolcanoRequests: Array<{ event?: number; sessionId?: string; json?: Record<string, unknown> }> = [];
+
+/** 「服务端」帧编码器：故意与主进程 decoder 不同源，才能验证协议双向一致 */
+function serverFrame(event: number, sessionId: string | undefined, payload: Buffer, useGzip = false): Buffer {
+  const body = useGzip ? gzipSync(payload) : payload;
+  const head = Buffer.alloc(8);
+  head.writeUInt8((0b0001 << 4) | 0b0001, 0); // version + header size
+  head.writeUInt8((0b0001 << 4) | 0b0100, 1); // full server response + event 字段标记
+  head.writeUInt8((0b0001 << 4) | (useGzip ? 0b0001 : 0b0000), 2); // JSON + compression
+  head.writeInt32BE(event, 4);
+  const parts: Buffer[] = [head];
+  // 多写一个 eventNumber（布局 B）：验证 decoder 的两种布局兼容能力
+  const eventNumber = Buffer.alloc(4);
+  eventNumber.writeInt32BE(event, 0);
+  parts.push(eventNumber);
+  if (sessionId !== undefined) {
+    const id = Buffer.from(sessionId, 'utf8');
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(id.length, 0);
+    parts.push(len, id);
+  }
+  const plen = Buffer.alloc(4);
+  plen.writeUInt32BE(body.length, 0);
+  parts.push(plen, body);
+  return Buffer.concat(parts);
+}
+
+function toArrayBuffer(buf: Buffer): ArrayBuffer {
+  const copy = new Uint8Array(buf.byteLength);
+  copy.set(buf);
+  return copy.buffer;
+}
+
+type VolcanoResponder = (req: { event?: number; sessionId?: string; json?: Record<string, unknown> }) => Array<() => Buffer>;
+
+function makeVolcanoMockWs(
+  responders: VolcanoResponder,
+  opts: { errorOnOpen?: boolean; closeOnOpen?: boolean } = {},
+): (url: string, headers: Record<string, string>) => WebSocketLike {
+  return (_url: string, headers: Record<string, string>) => {
+    lastVolcanoHeaders = headers;
+    const ws: WebSocketLike = {
+      binaryType: 'arraybuffer',
+      onopen: null,
+      onmessage: null,
+      onerror: null,
+      onclose: null,
+      send: (data: string | ArrayBufferView | ArrayBuffer) => {
+        const frame = decodeFrame(data);
+        if (!frame) return;
+        const req = { event: frame.event, sessionId: frame.sessionId, json: frame.json };
+        lastVolcanoRequests.push(req);
+        for (const make of responders(req)) {
+          setTimeout(() => ws.onmessage?.({ data: toArrayBuffer(make()) }), 0);
+        }
+      },
+      close: () => {},
+    };
+    setTimeout(() => {
+      if (opts.errorOnOpen) {
+        ws.onerror?.({});
+        return;
+      }
+      ws.onopen?.({});
+      if (opts.closeOnOpen) setTimeout(() => ws.onclose?.({}), 0);
+    }, 0);
+    return ws;
+  };
+}
+
+/** 一次成功会话的应答脚本（多分片且末片走 gzip，顺便压 gzip inflate 分支） */
+function volcanoSuccessScript(audioParts: Buffer[]): VolcanoResponder {
+  return (req) => {
+    switch (req.event) {
+      case VolcanoEvent.START_CONNECTION:
+        return [() => serverFrame(VolcanoEvent.CONNECTION_STARTED, undefined, Buffer.from('{}'))];
+      case VolcanoEvent.START_SESSION:
+        return [() => serverFrame(VolcanoEvent.SESSION_STARTED, req.sessionId, Buffer.from('{}'))];
+      case VolcanoEvent.TASK_REQUEST:
+        return audioParts.map((part, index) => () =>
+          serverFrame(
+            VolcanoEvent.TTS_RESPONSE,
+            req.sessionId,
+            part,
+            index === audioParts.length - 1 && audioParts.length > 1,
+          ),
+        );
+      case VolcanoEvent.FINISH_SESSION:
+        return [() => serverFrame(VolcanoEvent.SESSION_FINISHED, req.sessionId, Buffer.from('{}'))];
+      default:
+        return [];
+    }
+  };
+}
+
+/** 假 TTS 本地服务（三种协议形态） */
+async function startMockLocalTts(flavor: 'custom' | 'openai' | 'gradio', audio: Buffer): Promise<{
+  url: string;
+  close: () => Promise<void>;
+  hits: string[];
+}> {
+  const { createServer } = await import('node:http');
+  const hits: string[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(c as Buffer));
+    req.on('end', () => {
+      const url = req.url ?? '';
+      hits.push(`${req.method} ${url}`);
+      const sendAudio = () => {
+        res.writeHead(200, { 'content-type': 'audio/wav' });
+        res.end(audio);
+      };
+      const sendJson = (obj: unknown) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      if (flavor === 'custom') {
+        if (req.method === 'POST' && (url === '/tts' || url === '/tts/zero-shot')) return sendAudio();
+        res.writeHead(404);
+        return res.end();
+      }
+      if (flavor === 'openai') {
+        if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) return sendJson({ data: [] });
+        if (req.method === 'POST' && (url === '/v1/audio/speech' || url === '/audio/speech')) return sendAudio();
+        res.writeHead(404);
+        return res.end();
+      }
+      // gradio：/gradio_api/info → call → SSE → file
+      if (req.method === 'GET' && url.startsWith('/gradio_api/info')) {
+        return sendJson({ named_endpoints: { '/tts': { parameters: [], returns: [] } }, unnamed_endpoints: {} });
+      }
+      if (req.method === 'POST' && url === '/gradio_api/upload') {
+        return sendJson([{ path: '/tmp/kk-ref.wav' }]);
+      }
+      if (req.method === 'POST' && url === '/gradio_api/call/tts') return sendJson({ event_id: 'ev-1' });
+      if (req.method === 'GET' && url === '/gradio_api/call/tts/ev-1') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        return res.end(
+          `event: data\ndata: ${JSON.stringify({ value: [{ path: '/tmp/kk-out.wav', url: '/gradio_api/file=/tmp/kk-out.wav' }] })}\n\n`
+          + 'event: complete\ndata: {"event":"complete"}\n\n',
+        );
+      }
+      if (req.method === 'GET' && url === '/gradio_api/file=/tmp/kk-out.wav') return sendAudio();
+      res.writeHead(404);
+      return res.end();
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as import('node:net').AddressInfo).port;
+  const base = flavor === 'openai' ? `http://127.0.0.1:${port}/v1` : `http://127.0.0.1:${port}`;
+  return {
+    url: base,
+    hits,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** 取一个刚释放的真实端口：让本地环拿到 ECONNREFUSED（而不是端口 1 的 undici 参数错），诊断才是真的 */
+async function closedPort(): Promise<number> {
+  const { createServer } = await import('node:http');
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = (probe.address() as import('node:net').AddressInfo).port;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+/** P0：火山 v3 WebSocket 二进制流式——分帧拼接 / 鉴权头 / 会话时序 / 错误码 / 超时 / 取消 */
+async function ringTtsVolcanoV3Protocol(results: RingResult[]): Promise<void> {
+  const name = 'P0·火山 v3 WebSocket 二进制流式协议';
+  const original = loadTtsConfig();
+  const handlers: Record<string, (...a: any[]) => any> = (globalThis as any).__MIAOMA_IPC__;
+  try {
+    const part1 = Buffer.from('FAKE-TTS-AUDIO-CHUNK-ONE');
+    const part2 = Buffer.from('FAKE-TTS-AUDIO-CHUNK-TWO-GZIP');
+    lastVolcanoRequests = [];
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(volcanoSuccessScript([part1, part2])));
+    saveTtsConfig({
+      active: 'volcano',
+      volcano: { ...original.volcano, appId: 'smoke-app', accessToken: 'smoke-key', voice: 'zh_female_vv_uranus_bigtts', format: 'mp3', timeoutMs: 8000 },
+    });
+
+    const res = await handlers['tts:synthesize'](null, { text: `协议拼接-${Date.now()}`, provider: 'volcano' });
+    const bytes = fs.readFileSync(res.audioPath);
+    if (!bytes.equals(Buffer.concat([part1, part2]))) {
+      throw new Error(`分帧拼接不符（含 gzip 末片）：得到 ${bytes.length} 字节 / 期望 ${part1.length + part2.length}`);
+    }
+    if (lastVolcanoHeaders['X-Api-Resource-Id'] !== 'seed-tts-2.0') {
+      throw new Error(`uranus 音色应路由 seed-tts-2.0，实际 ${lastVolcanoHeaders['X-Api-Resource-Id'] ?? '无'}`);
+    }
+    if (!lastVolcanoHeaders['X-Api-App-Key'] || !lastVolcanoHeaders['X-Api-Access-Key'] || !lastVolcanoHeaders['X-Api-Connect-Id']) {
+      throw new Error('v3 鉴权握手头没带齐（App-Key / Access-Key / Connect-Id）');
+    }
+    const events = lastVolcanoRequests.map((r) => r.event).join('→');
+    // 1 建连 → 100 开会话 → 200 发文本 → 102 收会话 → 2 收尾（done() 会发 FinishConnection）
+    if (events !== [VolcanoEvent.START_CONNECTION, VolcanoEvent.START_SESSION, VolcanoEvent.TASK_REQUEST, VolcanoEvent.FINISH_SESSION, VolcanoEvent.FINISH_CONNECTION].join('→')) {
+      throw new Error(`会话时序不符：${events}`);
+    }
+
+    // speed=1 不下发 speech_rate；≠ 1 时按百分比偏移下发
+    const startSession = lastVolcanoRequests.find((r) => r.event === VolcanoEvent.START_SESSION);
+    const audioParams = (startSession?.json as { req_params?: { audio_params?: Record<string, unknown> } })?.req_params?.audio_params;
+    if (audioParams && 'speech_rate' in audioParams) {
+      throw new Error(`speed=1 不应下发 speech_rate，实际 ${JSON.stringify(audioParams)}`);
+    }
+    lastVolcanoRequests = [];
+    await handlers['tts:synthesize'](null, { text: `语速-1-3-${Date.now()}`, provider: 'volcano', speed: 1.3 });
+    const fast = lastVolcanoRequests.find((r) => r.event === VolcanoEvent.START_SESSION);
+    const fastParams = (fast?.json as { req_params?: { audio_params?: Record<string, unknown> } })?.req_params?.audio_params;
+    if (fastParams?.speech_rate !== 30) throw new Error(`speed=1.3 应下发 speech_rate=30，实际 ${JSON.stringify(fastParams)}`);
+
+    // resource id 不匹配（服务端回 SESSION_FAILED 55000000）→ 中文释义要能指导下一步
+    setVolcanoWebSocketFactory(makeVolcanoMockWs((req) =>
+      req.event === VolcanoEvent.START_SESSION
+        ? [() => serverFrame(VolcanoEvent.SESSION_FAILED, req.sessionId, Buffer.from(JSON.stringify({ error: { code: 55000000, message: 'resource ID is mismatched' } })))]
+        : [() => serverFrame(VolcanoEvent.CONNECTION_STARTED, undefined, Buffer.from('{}'))],
+    ));
+    let mismatchMsg = '';
+    try {
+      await handlers['tts:synthesize'](null, { text: `错配-${Date.now()}`, provider: 'volcano' });
+    } catch (e) {
+      mismatchMsg = (e as Error).message;
+    }
+    if (!/返回错误 55000000/.test(mismatchMsg) || !/seed-icl-2\.0/.test(mismatchMsg)) {
+      throw new Error(`55000000 应给出 resource 路由指引，实际：${mismatchMsg}`);
+    }
+
+    // 超时（服务端全程静默）与取消（预 abort）都不应挂死调用方
+    saveTtsConfig({ active: 'volcano', volcano: { ...original.volcano, appId: 'a', accessToken: 'b', voice: 'zh_female_roumei', timeoutMs: 3000 } });
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(() => []));
+    const config = loadTtsConfig();
+    let timeoutMsg = '';
+    try {
+      await runVolcanoSession(config, { text: 'x', speed: 1 });
+    } catch (e) {
+      timeoutMsg = (e as Error).message;
+    }
+    if (!/合成超时/.test(timeoutMsg)) throw new Error(`超时分支未触发：${timeoutMsg}`);
+
+    const controller = new AbortController();
+    controller.abort();
+    let abortName = '';
+    try {
+      await runVolcanoSession(config, { text: 'x', speed: 1 }, { signal: controller.signal });
+    } catch (e) {
+      abortName = (e as Error).name;
+    }
+    if (abortName !== 'AbortError') throw new Error(`预取消应抛 AbortError，实际 ${abortName || '未报错'}`);
+
+    results.push(ok(name, '分帧+gzip 拼接一致；鉴权头/会话时序/speech_rate 正确；55000000 给路由指引；超时与取消不挂死'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  } finally {
+    setVolcanoWebSocketFactory(null);
+    saveTtsConfig(original);
+  }
+}
+
+/**
+ * P0：本地 Index-TTS 2 三种真实形态协议对齐（官方 Gradio / OpenAI 兼容壳 / 内置壳）
+ * 外加「服务不可用时的可行动诊断」——无 GPU 环境下这条链必须说清楚为什么不行、下一步做什么。
+ */
+async function ringTtsLocalProtocols(results: RingResult[]): Promise<void> {
+  const name = 'P0·本地 Index-TTS 2 多协议与探活诊断';
+  const original = loadTtsConfig();
+  const servers: Array<{ close: () => Promise<void>; hits: string[]; url: string }> = [];
+  try {
+    const wavPath = path.join(BASE, 'local-tts-out.wav');
+    execFileSync(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=520:duration=1', '-ar', '24000', wavPath], { stdio: 'ignore' });
+    const realAudio = fs.readFileSync(wavPath);
+
+    for (const flavor of ['custom', 'openai', 'gradio'] as const) {
+      const mock = await startMockLocalTts(flavor, realAudio);
+      servers.push(mock);
+      resetLocalProbeCache();
+      saveTtsConfig({ ...original, active: 'local', local: { ...original.local, baseUrl: mock.url, mode: 'auto' } });
+
+      const report = await ttsProbe({ force: true });
+      if (!report.local.configured) throw new Error(`[${flavor}] 应判为已配置`);
+      if (!report.local.ok) throw new Error(`[${flavor}] 探活应成功，实际：${report.local.message}`);
+      if (report.local.protocol !== flavor) {
+        throw new Error(`[${flavor}] 协议识别错为 ${'protocol' in report.local ? report.local.protocol : '未知'}`);
+      }
+
+      const res = await synthesizeSpeech({ text: `本地-${flavor}-${Date.now()}`, provider: 'local' });
+      if (res.provider !== 'local') throw new Error(`[${flavor}] 应走 local，实际 ${res.provider}`);
+      if (!fs.readFileSync(res.audioPath).equals(realAudio)) throw new Error(`[${flavor}] 音频字节不一致`);
+    }
+
+    // 显式指定 gradio 模式时，即使 baseUrl 不带端口特征也必须按 Gradio REST 走
+    const gradioMock = servers[2]!;
+    resetLocalProbeCache();
+    saveTtsConfig({ ...original, active: 'local', local: { ...original.local, baseUrl: gradioMock.url, mode: 'gradio', gradioApiName: 'tts' } });
+    const forced = await ttsProbe({ force: true });
+    if (!('protocol' in forced.local) || forced.local.protocol !== 'gradio') throw new Error('mode=gradio 未生效');
+
+    // 服务没起来：ok=false 且 hints 必须给出「连不上 + 云端复刻出路」两条指引
+    resetLocalProbeCache();
+    const deadUrl = `http://127.0.0.1:${await closedPort()}`;
+    saveTtsConfig({ ...original, active: 'local', local: { ...original.local, baseUrl: deadUrl, mode: 'auto' } });
+    const dead = await ttsProbe({ force: true });
+    if (dead.local.ok) throw new Error('死端口不应探活成功');
+    if ('reachable' in dead.local && dead.local.reachable) throw new Error('连接层不可达时 reachable 必须为 false');
+    const hints = dead.local.hints.join('｜');
+    if (!/连接被拒|无法与本地服务建立连接/.test(hints) || !/云端复刻/.test(hints)) {
+      throw new Error(`死端口 hints 应含「连不上 + 云端复刻出路」，实际：${hints}`);
+    }
+
+    results.push(ok(name, 'custom/openai/gradio 三形态识别与合成字节一致；显式 mode 生效；宕机给可行动诊断'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  } finally {
+    for (const server of servers) await server.close().catch(() => {});
+    resetLocalProbeCache();
+    saveTtsConfig(original);
+  }
+}
+
+/** P0：零样本克隆降级链（本地优先 → 云端复刻 → 在线），每环原因可观察 */
+async function ringTtsCloneChain(results: RingResult[]): Promise<void> {
+  const name = 'P0·零样本克隆降级链与优先级';
+  const original = loadTtsConfig();
+  let mock: { close: () => Promise<void>; hits: string[]; url: string } | null = null;
+  try {
+    const refWav = path.join(BASE, 'chain-ref.wav');
+    execFileSync(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=380:duration=3.2', '-ar', '24000', refWav], { stdio: 'ignore' });
+    const voice = await addVoice(refWav, '链路测试声');
+    setVoiceSpeaker(voice.id, 'S_SMOKECLONE');
+
+    const cloudWav = path.join(BASE, 'chain-cloud.wav');
+    execFileSync(FFMPEG, ['-y', '-f', 'lavfi', '-i', 'sine=frequency=660:duration=1', '-ar', '24000', cloudWav], { stdio: 'ignore' });
+    const cloudAudio = fs.readFileSync(cloudWav);
+
+    // (1) 本地不可达 → 云端复刻接住（走 v3 WebSocket，resource 必须是 seed-icl-2.0 + model_type:4）
+    lastVolcanoRequests = [];
+    const deadLocalUrl = `http://127.0.0.1:${await closedPort()}`;
+    setVolcanoWebSocketFactory(makeVolcanoMockWs(volcanoSuccessScript([cloudAudio])));
+    saveTtsConfig({
+      active: 'volcano',
+      clonePreference: 'local-first',
+      volcano: { ...original.volcano, appId: 'app', accessToken: 'key', voice: 'zh_female_roumei', timeoutMs: 8000 },
+      local: { ...original.local, baseUrl: deadLocalUrl, mode: 'custom' },
+    });
+    resetLocalProbeCache();
+    const cloudHit = await synthesizeSpeech({ text: `云端接盘-${Date.now()}`, voiceId: voice.id });
+    if (cloudHit.provider !== 'zero-shot:cloud') throw new Error(`本地不可用应降级云端复刻，实际 ${cloudHit.provider}`);
+    if (lastVolcanoHeaders['X-Api-Resource-Id'] !== 'seed-icl-2.0') {
+      throw new Error(`复刻音色必须走 seed-icl-2.0，实际 ${lastVolcanoHeaders['X-Api-Resource-Id'] ?? '无'}`);
+    }
+    const sessionReq = lastVolcanoRequests.find((r) => r.event === VolcanoEvent.START_SESSION);
+    const additions = String((sessionReq?.json as { req_params?: { additions?: string } })?.req_params?.additions ?? '');
+    if (!additions.includes('model_type') || typeof additions !== 'string') {
+      throw new Error(`复刻会话必须带 additions 字符串（含 model_type），实际：${additions || '空'}`);
+    }
+    if (String((sessionReq?.json as { req_params?: { speaker?: string } })?.req_params?.speaker ?? '') !== 'S_SMOKECLONE') {
+      throw new Error('云端复刻未使用音色绑定的 Speaker ID');
+    }
+    const traceAfterCloud = ttsRouteTrace();
+    if (!traceAfterCloud.some((s) => s.stage === 'local-zero-shot' && !s.ok)) {
+      throw new Error(`降级链应记录本地失败原因，实际：${JSON.stringify(traceAfterCloud)}`);
+    }
+
+    // (2) 本地服务起来 → local-first 命中本地链（隐私优先）
+    mock = await startMockLocalTts('custom', cloudAudio);
+    resetLocalProbeCache();
+    saveTtsConfig({ ...loadTtsConfig(), local: { ...loadTtsConfig().local, baseUrl: mock.url, mode: 'custom' } });
+    const localHit = await synthesizeSpeech({ text: `本地优先-${Date.now()}`, voiceId: voice.id });
+    if (localHit.provider !== 'zero-shot:local') throw new Error(`本地可用应优先本地，实际 ${localHit.provider}`);
+
+    // (3) 切成云端优先：两边都可用时直接走云端
+    resetLocalProbeCache();
+    saveTtsConfig({ ...loadTtsConfig(), clonePreference: 'cloud-first' });
+    const cloudFirst = await synthesizeSpeech({ text: `云端优先-${Date.now()}`, voiceId: voice.id });
+    if (cloudFirst.provider !== 'zero-shot:cloud') throw new Error(`cloud-first 应走云端复刻，实际 ${cloudFirst.provider}`);
+
+    // (4) 两边都不行 → 回退常规链并保留两条失败原因（不静默、不阻断）
+    resetLocalProbeCache();
+    setVolcanoWebSocketFactory(null);
+    saveTtsConfig({
+      active: 'volcano',
+      clonePreference: 'local-first',
+      volcano: { ...original.volcano, appId: '', accessToken: '' },
+      local: { ...original.local, baseUrl: deadLocalUrl, mode: 'custom' },
+    });
+    let deadMsg = '';
+    try {
+      await synthesizeSpeech({ text: `全失败-${Date.now()}`, voiceId: voice.id });
+    } catch (e) {
+      deadMsg = (e as Error).message;
+    }
+    if (!/尚未配置火山引擎 TTS/.test(deadMsg)) throw new Error(`全链不可用应回退常规链报错，实际：${deadMsg}`);
+    const reason = zeroShotFallbackReason(voice.id) ?? '';
+    if (!/零样本/.test(reason) || !/已回退常规音色/.test(reason)) {
+      throw new Error(`降级原因应完整可观察，实际：${reason}`);
+    }
+
+    results.push(ok(name, '本地→云端→在线顺序生效；resource/model_type/speaker 正确；全失败原因可查不阻断'));
+  } catch (e) {
+    results.push(fail(name, (e as Error).message));
+  } finally {
+    if (mock) await mock.close().catch(() => {});
+    setVolcanoWebSocketFactory(null);
+    resetLocalProbeCache();
+    saveTtsConfig(original);
     for (const v of listVoices()) removeVoice(v.id);
   }
 }
@@ -2385,6 +2786,11 @@ export async function runSmoke(): Promise<RingResult[]> {
 
   // M3：声音克隆音色库与零样本路由
   await ringVoiceCloneM3(results);
+
+  // P0：火山 v3 二进制流式协议 / 本地多协议探活 / 零样本降级链
+  await ringTtsVolcanoV3Protocol(results);
+  await ringTtsLocalProtocols(results);
+  await ringTtsCloneChain(results);
 
   // M4：多模态解析降级与 AI 自动转场
   await ringVisionMultimodalM4(results);

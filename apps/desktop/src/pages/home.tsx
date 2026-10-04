@@ -1,15 +1,15 @@
 import { Clock, FolderOpen, Import, Sparkles, SquarePlus } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
-import { ThumbPlaceholder } from '@/components/ui/misc';
+import { ProjectCover } from '@/components/ui/misc';
 import { formatTimecode } from '@/lib/timeline-utils';
 import { hueOf } from '@/lib/project-bridge';
 import { openProject } from '@/lib/active-project';
 
 type ProjectSummary = Awaited<ReturnType<NonNullable<typeof window.electronAPI>['project']['list']>>[number];
 
-const quickActions = [
+const quickActions: { label: string; icon: typeof Sparkles; to: string; tone: string }[] = [
   { label: '开始新项目', icon: SquarePlus, to: '/new', tone: 'bg-violet-500/15 text-violet-400' },
-  { label: 'AI 智能创作', icon: Sparkles, to: '/ai', tone: 'bg-fuchsia-500/15 text-fuchsia-400' },
+  { label: 'AI 智能创作', icon: Sparkles, to: '/chat', tone: 'bg-fuchsia-500/15 text-fuchsia-400' },
   { label: '导入素材', icon: Import, to: '/library', tone: 'bg-sky-500/15 text-sky-400' },
   { label: '打开项目', icon: FolderOpen, to: '/projects', tone: 'bg-emerald-500/15 text-emerald-400' },
 ];
@@ -85,7 +85,7 @@ export default function HomePage() {
                 className="group cursor-pointer overflow-hidden rounded-xl border bg-card/60 transition-all hover:border-primary/40 hover:shadow-lg hover:shadow-primary/10"
               >
                 <div className="relative">
-                  <ThumbPlaceholder hue={hueOf(p.id)} className="aspect-video w-full" />
+                  <ProjectCover coverPath={p.coverPath} hue={hueOf(p.id)} className="aspect-video w-full" />
                   <span className="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
                     {formatTimecode(p.durationMs)}
                   </span>

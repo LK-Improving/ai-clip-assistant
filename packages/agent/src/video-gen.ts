@@ -29,21 +29,30 @@ export type VideoGenRatio = '16:9' | '9:16' | '1:1';
 /** 分辨率档位：官方 enum（MiniMax-H3 支持 768P/2K，H3-Max 支持 480P/768P） */
 export type VideoGenResolution = '480P' | '768P' | '2K';
 
+/** 生成模式：文生视频 / 首帧图生视频 / 首尾帧图生视频（MiniMax H3 v2 原生支持） */
+export type VideoGenMode = 't2v' | 'i2v' | 'fl2v';
+
 export interface VideoGenRequest {
   /** 文生视频提示词（也兼作图生视频/参考生视频的语义描述） */
   prompt: string;
   /** 期望时长（秒），Provider 负责夹取到模型允许区间（MiniMax H3 为 4–15s） */
   durationSec?: number;
-  /** 画幅比（文生视频必需）；默认按工程画布推断 */
+  /** 画幅比（文生视频必需）；默认按工程画布推断。图生视频时由首帧决定，该字段被忽略 */
   ratio?: VideoGenRatio;
   /** 分辨率档位；不传则用 Provider 构造时的默认（2K） */
   resolution?: VideoGenResolution;
+  /** 生成模式；缺省按输入推断（有 firstFrame→i2v、再加 lastFrame→fl2v，否则 t2v） */
+  mode?: VideoGenMode;
+  /** I2V/FL2V 首帧图（`data:image/<格式>;base64,` 或公网 URL）；与 referenceImage 互斥 */
+  firstFrame?: string;
+  /** FL2V 尾帧图；仅在 mode='fl2v' 时生效 */
+  lastFrame?: string;
   /**
    * 主体一致性参考图（`data:image/<格式>;base64,<Base64>` 或公网 URL）。
    *
    * 逐段独立文生视频会“每段抽出不同主体”（用户反馈：三只不一样的猫），
    * 把上一段产物的一帧作为参考图传入是业界标准的跨段锁主体手段。
-   * 不支持参考图的 Provider（如方舟 Seedance 纯文本任务）会直接忽略该字段。
+   * 官方规定 reference_image 与 first_frame/last_frame 不可混用；不支持参考图的 Provider 会忽略该字段。
    */
   referenceImage?: string;
 }
@@ -69,6 +78,8 @@ export interface VideoGenProvider {
    * 不声明（undefined）的 Provider 不参与整段模式，退回逐镜头生成。
    */
   readonly maxDurationSec?: number;
+  /** 支持的生成模式；缺省视为仅 ['t2v']。节点据此决定是否走 I2V 或退回 t2v */
+  readonly supportsModes?: VideoGenMode[];
   /** 配置是否齐全（缺密钥时上层跳过生成，而非中断整条链路） */
   isConfigured(): boolean;
   /** 生成一段视频并返回本地路径 */
@@ -79,6 +90,7 @@ export interface VideoGenProvider {
 export class OfflineVideoGenProvider implements VideoGenProvider {
   readonly id = 'offline';
   readonly label = '离线（不生成视频）';
+  readonly supportsModes: VideoGenMode[] = [];
 
   isConfigured(): boolean {
     return false;
@@ -177,6 +189,8 @@ export class MiniMaxH3VideoProvider implements VideoGenProvider {
   readonly label: string;
   /** 实测服务端：supported durations 4s–15s */
   readonly maxDurationSec = 15;
+  /** 原生支持文生/首帧图生/首尾帧图生（MiniMax H3 v2） */
+  readonly supportsModes: VideoGenMode[] = ['t2v', 'i2v', 'fl2v'];
   private readonly apiKey: string;
   private baseUrl: string;
   private readonly model: string;
@@ -214,11 +228,23 @@ export class MiniMaxH3VideoProvider implements VideoGenProvider {
     const resolution = req.resolution ?? this.resolution;
     const prompt = (req.prompt ?? '').trim();
     if (!prompt) throw new Error('[video-gen] 提示词为空');
+    // 模式推断：显式 mode 优先，否则有首帧→i2v（再加尾帧→fl2v），否则 t2v
+    const mode: VideoGenMode =
+      req.mode ?? (req.firstFrame ? (req.lastFrame ? 'fl2v' : 'i2v') : 't2v');
 
     this.logger?.(
-      `[video-gen] 创建任务：${prompt.slice(0, 40)}… (${ratio}, ${duration}s, ${resolution}${req.referenceImage ? ', +参考图锁主体' : ''})`,
+      `[video-gen] 创建任务：${prompt.slice(0, 40)}… (${mode === 't2v' ? `${ratio}, ` : '图生·自适应'}${duration}s, ${resolution}${mode !== 't2v' ? `, ${mode}` : req.referenceImage ? ', +参考图锁主体' : ''})`,
     );
-    const taskId = await this.createTask({ prompt, ratio, duration, resolution, referenceImage: req.referenceImage });
+    const taskId = await this.createTask({
+      prompt,
+      ratio,
+      duration,
+      resolution,
+      mode,
+      firstFrame: req.firstFrame,
+      lastFrame: req.lastFrame,
+      referenceImage: req.referenceImage,
+    });
     this.logger?.(`[video-gen] task_id=${taskId}`);
 
     const fileUrl = await this.pollUntilDone(taskId);
@@ -239,21 +265,29 @@ export class MiniMaxH3VideoProvider implements VideoGenProvider {
     ratio: VideoGenRatio;
     duration: number;
     resolution: VideoGenResolution;
+    mode: VideoGenMode;
+    firstFrame?: string;
+    lastFrame?: string;
     referenceImage?: string;
   }): Promise<string> {
     const content: Array<Record<string, unknown>> = [{ type: 'text', text: args.prompt }];
-    // 参考图走 reference_image（锁主体不锁构图）；官方规定它与 first_frame/last_frame 不可混用，
-    // 我们从不发 first_frame，所以不冲突
-    if (args.referenceImage) {
+    if (args.mode === 'i2v' || args.mode === 'fl2v') {
+      // 图生视频：首帧（必填）+ 尾帧（fl2v）；官方规定与 reference_image 互斥，不混发
+      if (args.firstFrame) content.push({ type: 'image_url', image_url: { url: args.firstFrame }, role: 'first_frame' });
+      if (args.mode === 'fl2v' && args.lastFrame)
+        content.push({ type: 'image_url', image_url: { url: args.lastFrame }, role: 'last_frame' });
+    } else if (args.referenceImage) {
+      // 参考图走 reference_image（锁主体不锁构图）
       content.push({ type: 'image_url', image_url: { url: args.referenceImage }, role: 'reference_image' });
     }
-    const body = {
+    const body: Record<string, unknown> = {
       model: this.model,
       content,
-      ratio: args.ratio,
       duration: args.duration,
       resolution: args.resolution,
     };
+    // ratio 仅文生视频必需；图生视频按首帧自适应（传了也会被服务端忽略），故省略
+    if (args.mode === 't2v') body.ratio = args.ratio;
     let { status, json } = await this.postCreate(body);
 
     // 国内 Key 打海外域名（或反之）只会给“invalid api key”，用户从文案里看不出是区域错：
@@ -435,6 +469,8 @@ export class HttpTaskVideoProvider implements VideoGenProvider {
   readonly label: string;
   /** 方舟 Seedance 只接受 3/5/10/12 四个档位，上限 12s；OpenAI 兼容任务协议按 15s 保守处理 */
   readonly maxDurationSec: number;
+  /** 方舟/OpenAI 兼容任务协议当前仅文生视频 */
+  readonly supportsModes: VideoGenMode[] = ['t2v'];
   private readonly opts: TaskVideoOptions;
   private readonly baseUrl: string;
 

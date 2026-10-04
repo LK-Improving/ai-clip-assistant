@@ -184,7 +184,8 @@ export async function runAgentSmoke(): Promise<RingResult[]> {
         results.push(bad('② 人机中断', `中断点应为 storyboard-review（LangGraph interrupt），实际 ${res.node}`));
       } else {
         // interrupt 发生在 storyboard-review 节点内部：该节点尚未完成，不入 completedNodes
-        const expected = ['scan-assets', 'creative-brief', 'storyboard-plan'];
+        // P4 后图序：storyboard-plan → match-assets → storyboard-image → storyboard-review（让人在确认界面就看到关键帧）
+        const expected = ['scan-assets', 'creative-brief', 'storyboard-plan', 'match-assets', 'storyboard-image'];
         const same =
           res.state.completedNodes.length === expected.length &&
           expected.every((n, i) => res.state.completedNodes[i] === n);

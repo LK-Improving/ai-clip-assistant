@@ -2,9 +2,11 @@ import type { Asset, Project } from '@miaoma/video-project';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import type { PipelineNode } from './constants';
 import type { VideoGenProvider } from './video-gen';
+import type { ImageGenProvider } from './image-gen';
 
 export type { Asset } from '@miaoma/video-project';
 export type { VideoGenProvider, VideoGenRequest, VideoGenResult } from './video-gen';
+export type { ImageGenProvider, ImageGenRequest, ImageGenResult, ImageGenMode } from './image-gen';
 
 /** ===== LLM Provider 接口（2.1，LangChain 模型抽象） ===== */
 
@@ -91,6 +93,8 @@ export interface StoryboardScene {
   durationMs: number;
   /** 指定配音音色（M3 音色库 id）；缺省用常规 TTS 音色 */
   voiceId?: string;
+  /** 分镜关键帧图本地路径（storyboard-image 节点产出）；有则 generate-clips 走 I2V 首帧驱动。可选字段，不升 Schema 版本 */
+  keyframePath?: string;
 }
 
 export interface Storyboard {
@@ -117,6 +121,12 @@ export interface SpeechSegment {
 export interface AgentState {
   requirement: string;
   sourceDirs: string[];
+  /**
+   * 角色设计图/主体参考图的本地绝对路径（可选）。
+   * storyboard-image 节点据此走图像编辑（edit）模式锁住主体外貌（发色/脸型/服装），
+   * 避免逐镜文生图的主体漂移；缺省或读图失败时退回纯文本锚点。
+   */
+  referenceImages?: string[];
   scannedAssets: Asset[];
   brief: Brief | null;
   storyboard: Storyboard | null;
@@ -137,6 +147,11 @@ export interface AgentDeps {
    * 真实实现为 MiniMaxH3VideoProvider，由 desktop 在「AI 设置」里配置密钥后注入。
    */
   videoGen?: VideoGenProvider;
+  /**
+   * 图像生成 Provider（P4a）：storyboard-image 节点用它逐镜出分镜关键帧。
+   * 可选：未配置（离线）时节点跳过关键帧生成，generate-clips 退回文生视频。
+   */
+  imageGen?: ImageGenProvider;
   /** 探测素材元数据；生产环境注入 desktop 的 probeMedia，离线环境注入启发式实现 */
   probe: (filePath: string) => Promise<MediaProbe>;
   /**
@@ -168,6 +183,8 @@ export interface AgentRunOptions {
   requirement: string;
   /** 参与剪辑的素材目录 */
   sourceDirs: string[];
+  /** 角色设计图/主体参考图本地路径（可选）：分镜关键帧优先据此锁主体外貌 */
+  referenceImages?: string[];
   /** 已有工程（二次编辑场景） */
   project?: Project;
   /** 注入真实 LLM / TTS / 媒体探测；缺省回退到离线 Provider */

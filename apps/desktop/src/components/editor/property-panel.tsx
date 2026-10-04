@@ -1,10 +1,27 @@
-import { Sparkles, Trash2 } from 'lucide-react';
+import { Image, Mic, Music2, Sparkles, Subtitles, Trash2 } from 'lucide-react';
+import { useState } from 'react';
+import type { LibraryAsset } from './asset-panel';
+import { cn } from '@/lib/utils';
 import { Badge, Switch } from '@/components/ui/misc';
-import { formatTimecodeMs, type SubtitleStyle, type TimelineClip } from '@/lib/timeline-utils';
+import { formatTimecodeMs, taskForTrack, type SubtitleStyle, type TimelineClip, type TimelineTrack } from '@/lib/timeline-utils';
+
+const tasks = [
+  { key: 'video', label: '画面', icon: Image },
+  { key: 'voice', label: '口播', icon: Mic },
+  { key: 'text', label: '字幕', icon: Subtitles },
+  { key: 'music', label: '音乐', icon: Music2 },
+] as const;
+type EditorTask = (typeof tasks)[number]['key'];
 
 interface PropertyPanelProps {
   clip: TimelineClip | null;
   trackKind: 'video' | 'audio' | 'text' | null;
+  tracks: TimelineTrack[];
+  selectedTrackId: string | null;
+  onSelectClip: (trackId: string, clipId: string) => void;
+  musicAssets: LibraryAsset[];
+  onAddMusic: (asset: LibraryAsset) => void;
+  onImportMusic: () => void;
   onClipChange: (patch: Partial<TimelineClip>) => void;
   onDeleteClip: () => void;
   /** AI 配音（模块 3.3） */
@@ -57,7 +74,8 @@ function LiveSlider({
         step={step}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
-        className="flex-1 accent-[hsl(var(--brand))]"
+        aria-label={label}
+        className="flex-1 accent-primary"
       />
       <span className="w-12 shrink-0 text-right font-mono text-[10px]">{display}</span>
     </div>
@@ -68,8 +86,14 @@ const fieldLabel = 'mb-2 text-[11px] font-medium text-muted-foreground';
 
 /** 右侧属性面板（模块 3.2 + 3.3）：片段属性、字幕编辑、变换、AI 配音 */
 export function PropertyPanel({
-  clip,
+  clip: selectedClip,
   trackKind,
+  tracks,
+  selectedTrackId,
+  onSelectClip,
+  musicAssets,
+  onAddMusic,
+  onImportMusic,
   onClipChange,
   onDeleteClip,
   ttsText,
@@ -78,6 +102,14 @@ export function PropertyPanel({
   ttsBusy,
   ttsMessage,
 }: PropertyPanelProps) {
+  const selectedTrack = tracks.find((track) => track.id === selectedTrackId);
+  const inferredTask = selectedTrack ? taskForTrack(selectedTrack) : 'video';
+  const selectionKey = `${selectedTrackId ?? ''}:${selectedClip?.id ?? ''}`;
+  const [choice, setChoice] = useState<{ selectionKey: string; task: EditorTask } | null>(null);
+  const task = choice?.selectionKey === selectionKey ? choice.task : inferredTask;
+  const clip = task === inferredTask ? selectedClip : null;
+  const taskTracks = tracks.filter((track) => taskForTrack(track) === task);
+  const taskLabel = tasks.find((item) => item.key === task)!.label;
   const isText = trackKind === 'text';
   const style: SubtitleStyle = clip?.textStyle ?? FALLBACK_TEXT_STYLE;
   const patchStyle = (patch: Partial<SubtitleStyle>) => {
@@ -86,24 +118,65 @@ export function PropertyPanel({
   };
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-l">
+    <aside aria-label="编辑任务设置" className="flex w-72 shrink-0 flex-col border-l">
+      <div role="tablist" aria-label="编辑任务" className="grid grid-cols-4 border-b">
+        {tasks.map(({ key, label, icon: Icon }) => (
+          <button key={key} id={`task-${key}`} role="tab" aria-selected={task === key}
+            aria-controls="editor-task-panel" tabIndex={task === key ? 0 : -1}
+            onClick={() => setChoice({ selectionKey, task: key })}
+            onKeyDown={(event) => {
+              const index = tasks.findIndex((item) => item.key === key);
+              const next = event.key === 'ArrowRight' ? (index + 1) % tasks.length
+                : event.key === 'ArrowLeft' ? (index + tasks.length - 1) % tasks.length
+                  : event.key === 'Home' ? 0 : event.key === 'End' ? tasks.length - 1 : null;
+              if (next === null) return;
+              event.preventDefault();
+              const nextTask = tasks[next]!;
+              setChoice({ selectionKey, task: nextTask.key });
+              document.getElementById(`task-${nextTask.key}`)?.focus();
+            }}
+            className={cn('flex flex-col items-center gap-1 border-b-2 py-3 text-xs transition-colors',
+              task === key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground')}>
+            <Icon className="size-4" />{label}
+          </button>
+        ))}
+      </div>
       <div className="flex items-center justify-between border-b p-3">
-        <h2 className="truncate text-xs font-semibold">{clip ? `属性 · ${clip.name}` : '属性'}</h2>
+        <h2 className="truncate text-xs font-semibold">{clip ? `${taskLabel} · ${clip.name}` : `${taskLabel}设置`}</h2>
         {clip ? (
           <Badge tone="brand">{trackKind === 'audio' ? '音频' : trackKind === 'text' ? '字幕' : '视频'}</Badge>
         ) : null}
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto p-3">
+      <div id="editor-task-panel" role="tabpanel" aria-labelledby={`task-${task}`} className="min-h-0 flex-1 space-y-4 overflow-y-auto p-3">
+        {taskTracks.some((track) => track.clips.length > 0) ? (
+          <label className="block space-y-2 text-xs">
+            <span className="text-muted-foreground">选择{taskLabel}片段</span>
+            <select aria-label={`选择${taskLabel}片段`} value={clip ? JSON.stringify([selectedTrackId, clip.id]) : ''}
+              onChange={(event) => {
+                if (!event.target.value) return;
+                const [trackId, clipId] = JSON.parse(event.target.value) as [string, string];
+                onSelectClip(trackId, clipId);
+              }} className="h-9 w-full rounded-md border border-input bg-card px-2">
+              <option value="">请选择片段</option>
+              {taskTracks.flatMap((track) => track.clips.map((item) => (
+                <option key={item.id} value={JSON.stringify([track.id, item.id])}>{track.name} · {item.name}</option>
+              )))}
+            </select>
+          </label>
+        ) : null}
         {!clip ? (
           <p className="text-[11px] leading-relaxed text-muted-foreground">
-            在时间线中选中片段后可调整入点、时长与音量；选中字幕可编辑文字与样式。
+            {task === 'video' ? '选择画面片段，调整时长、变换和原声音量。'
+              : task === 'voice' ? '选择口播片段调整音量，或输入文案生成配音。'
+                : task === 'text' ? '选择字幕片段，编辑文字、样式与位置。'
+                  : '选择音乐片段调整音量和淡入淡出，或从素材库添加配乐。'}
           </p>
         ) : (
           <>
-            <div>
-              <p className={fieldLabel}>时间信息</p>
-              <div className="space-y-1.5 text-[11px]">
+            <details className="rounded-lg border p-2.5">
+              <summary className="cursor-pointer text-xs font-medium text-muted-foreground">时间与裁剪</summary>
+              <div className="mt-3 space-y-1.5 text-[11px]">
                 <label className="flex items-center justify-between gap-2">
                   <span className="text-muted-foreground">入点（秒）</span>
                   <input
@@ -150,7 +223,7 @@ export function PropertyPanel({
                   </label>
                 ) : null}
               </div>
-            </div>
+            </details>
 
             {isText ? (
               <div className="space-y-2.5">
@@ -260,9 +333,9 @@ export function PropertyPanel({
 
             {!isText ? (
               <>
-                <div>
-                  <p className={fieldLabel}>转场</p>
-                  <div className="space-y-1.5 text-[11px]">
+                <details className="rounded-lg border p-2.5">
+                  <summary className="cursor-pointer text-xs font-medium text-muted-foreground">{task === 'video' ? '转场' : '淡入淡出'}</summary>
+                  <div className="mt-3 space-y-1.5 text-[11px]">
                     <label className="flex items-center justify-between gap-2">
                       <span className="text-muted-foreground">淡入（秒）</span>
                       <input
@@ -292,10 +365,10 @@ export function PropertyPanel({
                       />
                     </label>
                     <p className="text-[10px] leading-relaxed text-muted-foreground">
-                      导出时生效：视频/图片写为 fade 转场，音频写为音量淡变。
+                      {task === 'video' ? '淡入淡出将在导出时应用到画面。' : '淡入淡出将在导出时应用到音频。'}
                     </p>
                   </div>
-                </div>
+                </details>
 
                 {trackKind === 'video' ? (
                   <div>
@@ -368,7 +441,7 @@ export function PropertyPanel({
         )}
 
         {/* AI 配音 */}
-        <div className="space-y-2 rounded-lg border border-primary/30 bg-primary/5 p-3">
+        {task === 'voice' ? <div className="space-y-2 rounded-lg border border-primary/30 bg-primary/5 p-3">
           <div className="flex items-center gap-1.5 text-[11px] font-medium text-primary">
             <Sparkles className="size-3.5" /> AI 配音
           </div>
@@ -387,9 +460,24 @@ export function PropertyPanel({
             {ttsBusy ? '合成中...' : '生成语音'}
           </button>
           {ttsMessage ? (
-            <p className="text-[10px] leading-relaxed text-muted-foreground">{ttsMessage}</p>
+            <p role="status" className="text-[11px] leading-relaxed text-muted-foreground">{ttsMessage}</p>
           ) : null}
-        </div>
+        </div> : null}
+        {task === 'music' ? (
+          <section className="space-y-3">
+            <div className="flex items-center justify-between text-xs">
+              <h3 className="font-medium">素材库配乐</h3>
+              <button onClick={onImportMusic} className="text-primary hover:underline">导入音频</button>
+            </div>
+            {musicAssets.length ? musicAssets.map((asset) => (
+              <button key={asset.path} onClick={() => onAddMusic(asset)}
+                className="flex w-full items-center gap-2 rounded-lg border p-2 text-left text-xs hover:border-primary/50">
+                <Music2 className="size-4 shrink-0 text-primary" />
+                <span className="min-w-0 flex-1 truncate">{asset.name}</span><span className="text-primary">添加</span>
+              </button>
+            )) : <p className="text-xs leading-relaxed text-muted-foreground">还没有音频素材。导入后可添加到音乐轨。</p>}
+          </section>
+        ) : null}
       </div>
     </aside>
   );

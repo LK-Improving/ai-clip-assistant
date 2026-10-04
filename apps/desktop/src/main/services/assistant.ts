@@ -2,9 +2,12 @@ import { readFileSync } from 'node:fs';
 import { dirname, extname } from 'node:path';
 import {
   planEdits,
+  routeMultimodalIntent,
   type AssistantAction,
   type AssistantTimelineSnapshot,
   type EditPlan,
+  type RouteAttachment,
+  type RouteDecision,
   type VideoGenRatio,
 } from '@miaoma/agent';
 import { addAllowedPath } from '../protocol';
@@ -98,6 +101,9 @@ export function estimatePlanCost(plan: EditPlan, snapshot: AssistantTimelineSnap
 export async function planAssistantEdit(input: {
   message: string;
   snapshot: AssistantTimelineSnapshot;
+  history?: { role: 'user' | 'assistant'; text: string }[];
+  /** 会话内已解析的文档附件内容（跨轮记忆） */
+  docs?: { name: string; text: string }[];
 }): Promise<AssistantPlanResult> {
   const message = String(input.message ?? '').trim();
   if (!message) return { reply: '想让我做什么？例如「删掉音乐轨第 2 段」。', actions: [], cost: null };
@@ -112,8 +118,23 @@ export async function planAssistantEdit(input: {
     };
   }
 
-  const plan = await planEdits({ model, message, snapshot: input.snapshot });
+  const plan = await planEdits({ model, message, snapshot: input.snapshot, history: input.history, docs: input.docs });
   return { ...plan, cost: estimatePlanCost(plan, input.snapshot) };
+}
+
+/** 多模态输入意图路由（P3）：仅当携带附件时由渲染层调用；离线模型不做判断，回退为需澄清 */
+export async function routeAssistantIntent(input: { message: string; attachments: RouteAttachment[] }): Promise<RouteDecision> {
+  const model = resolveLlm();
+  if (model.providerId === 'offline') {
+    return {
+      intent: 'unknown',
+      confidence: 0,
+      needsClarify: true,
+      clarifyQuestion: '当前是离线模型，无法做内容识别与自动路由；请先在设置中心 → AI 配置里填好大模型（DeepSeek / 方舟 / Ollama 均可）。',
+      reply: '离线模型下我不能自动判断这些附件的用途。',
+    };
+  }
+  return routeMultimodalIntent({ model, message: String(input.message ?? '').trim(), attachments: input.attachments ?? [] });
 }
 
 export interface GenerateItem {

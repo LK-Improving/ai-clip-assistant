@@ -30,6 +30,7 @@
 }
 
 :root {
+  color-scheme: light;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
@@ -52,8 +53,9 @@
   --ring: oklch(0.708 0 0);
 }
 
-/* 剪辑工具默认深色 + KK剪映品牌紫（对照设计稿 12 屏） */
+/* 剪辑工具默认深色 + VideoFlow 品牌紫（对照设计稿） */
 .dark {
+  color-scheme: dark;
   --background: oklch(0.165 0.018 290);
   --foreground: oklch(0.96 0.005 290);
   --card: oklch(0.215 0.022 290);
@@ -86,6 +88,16 @@
       'Inter', 'Microsoft YaHei', system-ui, -apple-system, 'Segoe UI', sans-serif;
     -webkit-font-smoothing: antialiased;
   }
+
+  /* 原生下拉展开面板：跟随深色主题 + 显式给选项上色，避免白底浅字看不清 */
+  .dark select {
+    color-scheme: dark;
+  }
+  select option,
+  select optgroup {
+    background-color: var(--popover);
+    color: var(--popover-foreground);
+  }
 }
 
 @layer utilities {
@@ -108,6 +120,59 @@
       radial-gradient(44rem 26rem at 88% 12%, rgb(56 189 248 / 0.16), transparent 60%),
       radial-gradient(50rem 34rem at 55% 110%, rgb(192 132 252 / 0.22), transparent 62%),
       oklch(0.14 0.02 290);
+  }
+
+  /* 启动页沉浸式极光背景（对照设计稿：深蓝紫夜空 + 侧向光晕） */
+  .bg-hero {
+    background:
+      radial-gradient(58rem 38rem at 12% 18%, rgb(79 70 229 / 0.42), transparent 62%),
+      radial-gradient(46rem 34rem at 88% 26%, rgb(168 85 247 / 0.3), transparent 64%),
+      radial-gradient(64rem 44rem at 62% 118%, rgb(56 189 248 / 0.2), transparent 62%),
+      linear-gradient(158deg, #080b1e 0%, #0b1030 42%, #150a2e 100%);
+  }
+
+  /* 流动光带（模糊渐变条，模拟设计稿的极光丝带） */
+  .hero-ribbon {
+    background: linear-gradient(
+      100deg,
+      transparent 0%,
+      rgb(99 102 241 / 0.55) 28%,
+      rgb(192 132 252 / 0.6) 52%,
+      rgb(56 189 248 / 0.42) 74%,
+      transparent 100%
+    );
+    filter: blur(46px);
+  }
+
+  /* 传送门：渐变描边 + 内发光（对照设计稿右侧光门） */
+  .hero-portal {
+    background: linear-gradient(180deg, rgb(124 58 237 / 0.28), rgb(56 189 248 / 0.18));
+    box-shadow:
+      0 0 0 1.5px rgb(168 85 247 / 0.55),
+      0 0 60px 6px rgb(124 58 237 / 0.5),
+      inset 0 0 40px rgb(56 189 248 / 0.35);
+  }
+
+  /* 地面倒影遮罩 */
+  .hero-reflection {
+    -webkit-mask-image: linear-gradient(180deg, rgb(0 0 0 / 0.5), transparent 80%);
+    mask-image: linear-gradient(180deg, rgb(0 0 0 / 0.5), transparent 80%);
+  }
+
+  /* 隐藏原生滚动条（保留滚轮/触控板/拖拽滚动），用自定义细指示器替代 */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
+
+  /* 文本域高度随内容自适应（Chromium 123+，Electron 44 支持），配合 min/max-height 限定区间 */
+  .auto-textarea {
+    field-sizing: content;
   }
 
   /* 时间线波形纹理 */

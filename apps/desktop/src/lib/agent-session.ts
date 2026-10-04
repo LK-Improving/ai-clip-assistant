@@ -18,6 +18,8 @@ export interface AgentSessionState {
   projectId: string | null;
   requirement: string;
   sourceDirs: string[];
+  /** 角色设计图/主体参考图路径：重新生成时需原样带上，否则关键帧退化为纯文生图丢主体一致性 */
+  referenceImages: string[];
   logs: string[];
   /** M2：当前 LLM 节点的 token 流式正文（打字机展示；节点切换/终态时重置） */
   streamText: string;
@@ -34,6 +36,7 @@ function initial(): AgentSessionState {
     projectId: null,
     requirement: '',
     sourceDirs: [],
+    referenceImages: [],
     logs: [],
     streamText: '',
   };
@@ -73,8 +76,8 @@ function bridge() {
   return typeof window === 'undefined' ? undefined : window.electronAPI;
 }
 
-/** 启动一次 AI 剪辑（跑到分镜规划后中断） */
-export async function startAgent(requirement: string, sourceDirs: string[]): Promise<boolean> {
+/** 启动一次 AI 剪辑（跑到分镜规划后中断）；referenceImages 为角色设计图/主体参考图本地路径（可选） */
+export async function startAgent(requirement: string, sourceDirs: string[], referenceImages: string[] = []): Promise<boolean> {
   const api = bridge();
   if (!api) {
     setState({ status: 'error', error: '当前为浏览器预览模式，无法调用 AI 引擎' });
@@ -86,9 +89,10 @@ export async function startAgent(requirement: string, sourceDirs: string[]): Pro
     node: 'scan-assets',
     requirement,
     sourceDirs,
+    referenceImages,
   });
   try {
-    applySnapshot(await api.agent.start({ requirement, sourceDirs }));
+    applySnapshot(await api.agent.start({ requirement, sourceDirs, referenceImages }));
     return true;
   } catch (e) {
     setState({ status: 'error', error: (e as Error).message });

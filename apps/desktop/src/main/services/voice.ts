@@ -13,6 +13,7 @@ import { resolveFfmpegPath } from '../ffmpeg';
  * - 样本 userData/voices/<id>.<ext>：导入即拷贝进私有目录（与原始文件解耦，删除连带清理）；
  * - 导入校验：音频扩展名 + 时长 3–20s + 非静音（ffmpeg volumedetect mean_volume > -60dB）。
  *   校验不过直接拒绝入库——坏参考音频只会产出坏克隆，宁可拒在门外。
+ * - 可选绑定云端复刻 Speaker ID（火山 S_xxxxx）：本地无 GPU 时零样本克隆仍有真实可用路径。
  */
 
 export interface VoiceProfile {
@@ -24,6 +25,12 @@ export interface VoiceProfile {
   durationMs: number;
   /** 导入时检测到的平均音量 dB（volumedetect 解析失败为 null） */
   meanVolumeDb: number | null;
+  /**
+   * 云端复刻音色 ID（火山语音控制台给的 S_xxxxx）。
+   * 无 NVIDIA 显卡跑不动本地 Index-TTS 2 时，这条是真实可用的零样本克隆路径；
+   * 留空表示该音色只能走本地零样本链。
+   */
+  cloudSpeaker?: string;
 }
 
 const AUDIO_EXT = new Set(['.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg']);
@@ -103,8 +110,9 @@ function detectMeanVolumeDb(filePath: string): Promise<number | null> {
  * 导入参考音频：校验 → 拷贝样本 → 登记索引。
  * 校验失败抛中文错误（UI 直接展示），不落索引。
  */
-export async function addVoice(srcPath: string, displayName?: string): Promise<VoiceProfile> {
+export async function addVoice(srcPath: string, displayName?: string, cloudSpeaker?: string): Promise<VoiceProfile> {
   if (!existsSync(srcPath)) throw new Error('参考音频文件不存在');
+  const speaker = normalizeCloudSpeaker(cloudSpeaker);
   const ext = path.extname(srcPath).toLowerCase();
   if (!AUDIO_EXT.has(ext)) {
     throw new Error(`不支持的参考音频格式「${ext || '未知'}」，请使用 wav / mp3 / m4a / aac / flac / ogg`);
@@ -138,9 +146,32 @@ export async function addVoice(srcPath: string, displayName?: string): Promise<V
     createdAt: new Date().toISOString(),
     durationMs: probe.durationMs,
     meanVolumeDb,
+    ...(speaker ? { cloudSpeaker: speaker } : {}),
   };
   saveIndexVoices([...loadIndex(), profile]);
   return profile;
+}
+
+/** 云端 Speaker ID 只接受 S_xxxxx 形态；空串视为解绑 */
+function normalizeCloudSpeaker(input?: string): string | undefined {
+  const value = (input ?? '').trim();
+  if (!value) return undefined;
+  if (!/^S_[\w-]{2,40}$/i.test(value)) {
+    throw new Error(`云端 Speaker ID 形态不对：${value}（应为语音控制台给的 S_ 开头音色 ID，留空表示只用本地克隆）`);
+  }
+  return value;
+}
+
+/** 给既有音色绑定 / 解绑云端复刻 Speaker ID（不重导参考音频即可补上云端链路） */
+export function setVoiceSpeaker(id: string, cloudSpeaker?: string): VoiceProfile {
+  const voices = loadIndex();
+  const target = voices.find((v) => v.id === id);
+  if (!target) throw new Error('音色不存在（可能已删除）');
+  const speaker = normalizeCloudSpeaker(cloudSpeaker);
+  const updated: VoiceProfile = { ...target, ...(speaker ? { cloudSpeaker: speaker } : {}) };
+  if (!speaker) delete updated.cloudSpeaker;
+  saveIndexVoices(voices.map((v) => (v.id === id ? updated : v)));
+  return updated;
 }
 
 /** 删除音色：索引与样本文件一并清理（隐私要求：不留孤儿参考音频） */

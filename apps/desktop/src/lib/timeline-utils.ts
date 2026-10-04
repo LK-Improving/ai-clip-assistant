@@ -73,6 +73,12 @@ export interface TimelineTrack {
   clips: TimelineClip[];
 }
 
+/** 沿用工程的音乐轨命名，其余音频轨用于口播/普通音频。 */
+export function taskForTrack(track: TimelineTrack): 'video' | 'voice' | 'text' | 'music' {
+  if (track.kind !== 'audio') return track.kind;
+  return /音乐|配乐|music|bgm/i.test(track.name) ? 'music' : 'voice';
+}
+
 export function totalDuration(tracks: TimelineTrack[]): number {
   return tracks.reduce(
     (max, track) =>

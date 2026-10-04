@@ -53,8 +53,11 @@ export function Timeline({
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const laneRef = useRef<HTMLDivElement | null>(null);
+  const indicatorRef = useRef<HTMLDivElement | null>(null);
+  const scrollDragging = useRef(false);
   const [laneWidth, setLaneWidth] = useState(800);
   const [zoom, setZoom] = useState(1);
+  const [scrollInfo, setScrollInfo] = useState({ left: 0, client: 0, content: 0 });
 
   // 以滚动容器可见宽度（减去左侧轨道头 6rem = 96px）为基准换算像素比例，
   // 这样即便横向放大、内容超出视口，pxPerMs 仍稳定，不会出现循环依赖。
@@ -75,6 +78,32 @@ export function Timeline({
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  // 同步横向滚动位置给自定义指示器（替代原生滚动条）
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const on = () => setScrollInfo({ left: el.scrollLeft, client: el.clientWidth, content: el.scrollWidth });
+    on();
+    el.addEventListener('scroll', on, { passive: true });
+    return () => el.removeEventListener('scroll', on);
+  }, []);
+
+  // 内容宽度变化（缩放 / 轨道增减）时重算指示器
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) setScrollInfo({ left: el.scrollLeft, client: el.clientWidth, content: el.scrollWidth });
+  }, [contentWidthPx, zoom]);
+
+  const scrollFromPointer = (clientX: number) => {
+    const el = scrollRef.current;
+    const track = indicatorRef.current;
+    if (!el || !track) return;
+    const rect = track.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const ratio = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+    el.scrollLeft = ratio * Math.max(0, el.scrollWidth - el.clientWidth);
+  };
 
   // 播放头跟随：播放过程中自动横向滚动，保证播放头始终落在可视区内
   useEffect(() => {
@@ -181,7 +210,17 @@ export function Timeline({
       </div>
 
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        <div ref={scrollRef} className="h-full overflow-auto">
+        <div
+          ref={scrollRef}
+          className="no-scrollbar h-full overflow-auto"
+          onWheel={(event) => {
+            // 无纵向溢出时，把纵向滚轮映射为横向浏览（隐藏滚动条后的优雅替代）
+            const el = scrollRef.current;
+            if (el && el.scrollHeight <= el.clientHeight && event.deltaY !== 0) {
+              el.scrollLeft += event.deltaY;
+            }
+          }}
+        >
           <div className="flex min-h-full" style={{ width: `calc(6rem + ${contentWidthPx}px)` }}>
             {/* 轨道头（横向滚动时粘性固定在左侧） */}
             <div className="sticky left-0 z-20 w-24 shrink-0 bg-card">
@@ -302,6 +341,41 @@ export function Timeline({
           </div>
         </div>
       </div>
+
+      {/* 自定义横向滚动指示器（替代丑陋的原生滚动条）：可拖拽、随缩放/滚动实时更新 */}
+      {scrollInfo.content > scrollInfo.client + 1 ? (
+        <div
+          ref={indicatorRef}
+          title="拖动浏览时间线"
+          onPointerDown={(event) => {
+            scrollDragging.current = true;
+            event.currentTarget.setPointerCapture(event.pointerId);
+            scrollFromPointer(event.clientX);
+          }}
+          onPointerMove={(event) => {
+            if (scrollDragging.current) scrollFromPointer(event.clientX);
+          }}
+          onPointerUp={(event) => {
+            scrollDragging.current = false;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          className="flex h-4 shrink-0 cursor-pointer items-center px-3"
+        >
+          {(() => {
+            const max = scrollInfo.content - scrollInfo.client;
+            const w = Math.max(8, (scrollInfo.client / scrollInfo.content) * 100);
+            const left = max > 0 ? (scrollInfo.left / max) * (100 - w) : 0;
+            return (
+              <div className="relative h-1 w-full rounded-full bg-secondary">
+                <div
+                  className="absolute top-1/2 h-2.5 -translate-y-1/2 rounded-full bg-primary/50 transition-colors hover:bg-primary"
+                  style={{ width: `${w}%`, left: `${left}%` }}
+                />
+              </div>
+            );
+          })()}
+        </div>
+      ) : null}
 
       <div className="flex h-6 shrink-0 items-center gap-2 border-t px-3 text-[10px] text-muted-foreground">
         <Badge>拖拽片段移动 · 点击标尺跳转 · 素材拖入轨道</Badge>

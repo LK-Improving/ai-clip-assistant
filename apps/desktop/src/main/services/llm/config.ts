@@ -22,6 +22,8 @@ export interface OllamaLlmConfig {
   /** 本地 Ollama 服务地址（M1：三模型引擎之一，纯离线/私有化场景） */
   baseUrl: string;
   model: string;
+  /** 可选：本地视觉模型 id（如 qwen2.5-vl:7b），配置后图片附件生成画面描述 */
+  visionModel?: string;
 }
 
 export interface CustomLlmConfig {
@@ -30,6 +32,8 @@ export interface CustomLlmConfig {
   apiKey: string;
   /** 模型 id 以服务商控制台为准（如 deepseek-chat / deepseek-reasoner） */
   model: string;
+  /** 可选：同端点下的视觉模型 id（如 qwen-vl-max），配置后图片附件生成画面描述 */
+  visionModel?: string;
 }
 
 export interface LlmConfig {

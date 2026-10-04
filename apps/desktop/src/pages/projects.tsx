@@ -1,6 +1,6 @@
 import { ArrowDownUp, CheckSquare, Ellipsis, History, RotateCcw, Search, SquarePlus, Trash2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ThumbPlaceholder } from '@/components/ui/misc';
+import { ProjectCover } from '@/components/ui/misc';
 import { formatTimecode } from '@/lib/timeline-utils';
 import { hueOf } from '@/lib/project-bridge';
 import { openProject } from '@/lib/active-project';
@@ -444,7 +444,7 @@ export default function ProjectsPage() {
               }`}
             >
               <div className="relative">
-                <ThumbPlaceholder hue={hueOf(p.id)} className="aspect-video w-full" />
+                <ProjectCover coverPath={p.coverPath} hue={hueOf(p.id)} className="aspect-video w-full" />
                 <span className="absolute right-1.5 bottom-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
                   {formatTimecode(p.durationMs)}
                 </span>

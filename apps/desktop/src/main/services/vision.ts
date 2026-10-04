@@ -146,48 +146,102 @@ export async function embedQueryText(text: string): Promise<number[] | null> {
   }
 }
 
+/** 当前激活 Provider 的视觉能力概况：供 UI/日志判断“图片为什么没被识别” */
+export function visionCaptionStatus(): { available: boolean; reason: string } {
+  const cfg = loadLlmConfig();
+  if (cfg.active === 'offline') return { available: false, reason: '当前为离线 Provider，无法识别图片内容；切到方舟/Ollama/自定义并填视觉模型 id' };
+  if (cfg.active === 'ark') {
+    const key = cfg.ark.apiKey?.trim() || process.env.ARK_API_KEY;
+    if (!cfg.ark.visionModel?.trim()) return { available: false, reason: '未配置方舟视觉模型 id（设置 → AI 设置 → 大语言模型 → 视觉模型）' };
+    if (!key) return { available: false, reason: '未配置方舟 API Key，无法调用视觉模型' };
+    return { available: true, reason: `方舟 ${cfg.ark.visionModel}` };
+  }
+  if (cfg.active === 'custom') {
+    if (!cfg.custom.visionModel?.trim()) return { available: false, reason: '未配置自定义端点的视觉模型 id（需服务商支持图片输入的模型，如 qwen-vl-max）' };
+    if (!cfg.custom.apiKey?.trim() || !cfg.custom.baseUrl?.trim()) return { available: false, reason: '自定义端点的 API Key/接入点未填，无法调用视觉模型' };
+    return { available: true, reason: `自定义 ${cfg.custom.visionModel}` };
+  }
+  // ollama：本机服务选了就算可用，连接失败由超时兑底
+  if (!cfg.ollama.visionModel?.trim()) return { available: false, reason: '未配置本地视觉模型 id（如 qwen2.5-vl:7b，需先 ollama pull）' };
+  return { available: true, reason: `Ollama ${cfg.ollama.visionModel}` };
+}
+
+/** OpenAI 兼容端点按激活 Provider 组装：{基址, apiKey, 模型}；不可用返回 null */
+function resolveVisionEndpoint(): { base: string; apiKey: string; model: string } | null {
+  const cfg = loadLlmConfig();
+  if (cfg.active === 'ark') {
+    const key = cfg.ark.apiKey?.trim() || process.env.ARK_API_KEY || '';
+    const model = cfg.ark.visionModel?.trim();
+    if (!model || !key) return null;
+    return { base: cfg.ark.baseUrl.replace(/\/chat\/completions\/?$/, ''), apiKey: key, model };
+  }
+  if (cfg.active === 'custom') {
+    const model = cfg.custom.visionModel?.trim();
+    if (!model || !cfg.custom.apiKey?.trim() || !cfg.custom.baseUrl?.trim()) return null;
+    return { base: cfg.custom.baseUrl.replace(/\/chat\/completions\/?$/, ''), apiKey: cfg.custom.apiKey.trim(), model };
+  }
+  if (cfg.active === 'ollama') {
+    const model = cfg.ollama.visionModel?.trim();
+    const root = cfg.ollama.baseUrl?.trim();
+    if (!model || !root) return null;
+    // Ollama 的 OpenAI 兼容层在根路径下追加 /v1
+    const base = /\/v1$/.test(root) ? root : `${root.replace(/\/+$/, '')}/v1`;
+    return { base, apiKey: 'ollama', model };
+  }
+  return null;
+}
+
+function imageMime(imagePath: string): string {
+  const ext = path.extname(imagePath).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  if (ext === '.bmp') return 'image/bmp';
+  return 'image/jpeg';
+}
+
 /**
- * 视觉描述（可选路径）：配置了方舟 visionModel 时对帧图生成中文 caption。
- * 未配置 / 请求失败返回 null，由调用方保留启发式描述。带 8s 超时保护扫描节奏。
+ * 视觉描述（可选路径）：按激活 LLM Provider（方舟/自定义/Ollama）配置的 visionModel 生成中文 caption。
+ * 未配置 / 请求失败返回 null，由调用方保留占位说明。带 15s 超时保护（本地模型首次加载慢）。
  */
 export async function describeImage(imagePath: string): Promise<string | null> {
-  const cfg = loadLlmConfig();
-  const visionModel = cfg.ark.visionModel?.trim();
-  const apiKey = cfg.ark.apiKey?.trim() || process.env.ARK_API_KEY;
-  if (!visionModel || !apiKey || !existsSync(imagePath)) return null;
+  const endpoint = resolveVisionEndpoint();
+  if (!endpoint || !existsSync(imagePath)) return null;
   try {
-    const base = (cfg.ark.baseUrl || '').replace(/\/chat\/completions\/?$/, '');
-    if (!base) return null;
     const imageBase64 = readFileSync(imagePath).toString('base64');
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8_000);
+    const timer = setTimeout(() => controller.abort(), 15_000);
     try {
-      const res = await fetch(`${base}/chat/completions`, {
+      const res = await fetch(`${endpoint.base}/chat/completions`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${endpoint.apiKey}`, 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          model: visionModel,
-          max_tokens: 120,
+          model: endpoint.model,
+          max_tokens: 160,
           messages: [
             {
               role: 'user',
               content: [
-                { type: 'text', text: '用一句不超过40字的中文描述这张画面的主体、场景与氛围，只输出描述本身。' },
-                { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+                { type: 'text', text: '用一句不超过60字的中文描述这张画面的主体（含外貌/发色/服装细节）、场景与氛围，只输出描述本身。' },
+                { type: 'image_url', image_url: { url: `data:${imageMime(imagePath)};base64,${imageBase64}` } },
               ],
             },
           ],
         }),
       });
-      if (!res.ok) return null;
+      if (!res.ok) {
+        visionReason = `视觉模型调用失败 HTTP ${res.status}（${endpoint.model}）`;
+        return null;
+      }
       const json = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
       const caption = json.choices?.[0]?.message?.content?.trim();
       return caption && caption.length <= 200 ? caption : null;
     } finally {
       clearTimeout(timer);
     }
-  } catch {
+  } catch (e) {
+    visionReason = `视觉模型调用异常：${(e as Error).message}`.slice(0, 200);
     return null;
   }
 }

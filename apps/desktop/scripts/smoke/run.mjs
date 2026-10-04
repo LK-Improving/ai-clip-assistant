@@ -67,7 +67,7 @@ process.env.MIAOMA_SMOKE = '1';
 
 const OUT = path.join(os.tmpdir(), `miaoma-smoke-${process.pid}.cjs`);
 
-console.log('== 全链路冒烟测试（P0 + P1 + 更细异常 + P1扩展 + 阶段二AI接入与配置，共 27 环）==');
+console.log('== 全链路冒烟测试（P0 + P1 + 更细异常 + P1扩展 + 阶段二AI接入与配置 + M3~M6 + TTS 协议环，共 40 环）==');
 console.log(`userData: ${USERDATA}`);
 console.log(`ffmpeg : ${process.env.MIAOMA_FFMPEG}`);
 console.log('');
